@@ -1,14 +1,14 @@
 # ACOM Amplifier Control System
 
-A complete wireless control solution for the ACOM 600S RF amplifier, consisting of an ESP32-S3 hardware interface and a native macOS application.
+A complete wireless control solution for the ACOM RF amplifier, consisting of an ESP32-S3 hardware interface and a native macOS application.
 
 ## System Overview
 
 ```
-┌─────────────────┐     RS-232      ┌─────────────────┐      WiFi       ┌─────────────────┐
-│   ACOM 600S     │◄───────────────►│    ESP32-S3     │◄───────────────►│   macOS App     │
-│   Amplifier     │    9600 8N1     │   Controller    │   WebSocket     │   AcomControl   │
-└─────────────────┘                 └─────────────────┘                 └─────────────────┘
+┌─────────────────┐     RS-232      ┌─────────────────┐      WiFi       ┌─────────────────-┐
+│   ACOM          │◄───────────────►│    ESP32-S3     │◄───────────────►│   macOS App or   │
+│   Amplifier     │    9600 8N1     │   Controller    │   WebSocket     │   WebAcomControl │
+└─────────────────┘                 └─────────────────┘                 └─────────────────-┘
 ```
 
 The ESP32-S3 acts as a bridge between the amplifier's serial protocol and modern network interfaces, providing real-time telemetry and control via WebSocket and REST APIs.
@@ -17,7 +17,7 @@ The ESP32-S3 acts as a bridge between the amplifier's serial protocol and modern
 
 ## macOS Application
 
-**AcomControl** is a native SwiftUI application providing professional monitoring and control of the ACOM 600S amplifier.
+**AcomControl** is a native SwiftUI application providing professional monitoring and control of the ACOM amplifier.
 
 ### Features
 
@@ -45,7 +45,7 @@ The ESP32-S3 acts as a bridge between the amplifier's serial protocol and modern
   - Keyboard shortcuts
   - Responsive layout
 
-### Requirements
+### OSX App Requirements
 
 - macOS 13.0 (Ventura) or later
 - Xcode 15.0+ (for building from source)
@@ -70,17 +70,17 @@ open AcomControl.xcodeproj
 
 ## ESP32-S3 Controller
 
-The ESP32 firmware provides the hardware interface to the ACOM 600S amplifier and exposes network APIs for remote control.
+The ESP32 firmware provides the hardware interface to the ACOM amplifier and exposes network APIs for remote control.
 
 ### Features
 
-- **ACOM Protocol Implementation** — Full support for the ACOM 600S serial protocol
+- **ACOM Protocol Implementation** — Full support for the ACOM serial protocol
   - Automatic telemetry parsing (message 0x2F)
   - Command transmission with proper checksums
   - Error code decoding
   
 - **Network Interfaces**
-  - WebSocket server (`/ws`) for real-time bidirectional communication
+  - WebSocket server (`/ws`) for real-time bidirectional communication (available on port 80 of the ESP device IP)
   - REST API for status and control
   - Server-Sent Events (`/api/telemetry`) for streaming updates
   - Built-in web interface for browser-based monitoring
@@ -99,7 +99,7 @@ The ESP32 firmware provides the hardware interface to the ACOM 600S amplifier an
 | GPIO17 (TX)  | ACOM RS-232 RX (via level shifter) |
 | GND          | RS-232 Ground |
 
-**Note:** The ACOM 600S uses RS-232 voltage levels (±12V). A level shifter (e.g., MAX3232) is required between the ESP32 (3.3V logic) and the amplifier.
+**Note:** The ACOM uses RS-232 voltage levels (±12V). A level shifter (e.g., MAX3232) is required between the ESP32 (3.3V logic) and the amplifier.
 
 ### API Reference
 
@@ -170,7 +170,7 @@ Further ESP32 documentation, including detailed setup and configuration, is avai
 
 ## Protocol Notes
 
-The system implements the ACOM 600S serial protocol as documented in `ACOM_Protocol.pdf`:
+The system implements the ACOM serial protocol as documented in `ACOM_Protocol.pdf`:
 
 - **Baud Rate:** 9600, 8N1
 - **Start Byte:** 0x55
