@@ -17,6 +17,33 @@ native macOS application.
 **Firmware v7.0 · macOS app v3.0.** See [CHANGELOG.md](CHANGELOG.md) for what
 changed and why.
 
+## Download
+
+Prebuilt binaries are on the
+[latest release](https://github.com/pingpongshow/AcomControl/releases/latest):
+
+| File | Use |
+|---|---|
+| `AcomControl-7.0-esp32s3-full.bin` | First-time flash — bootloader, partitions and app in one image, written to `0x0` |
+| `AcomControl-7.0-esp32s3-ota.bin` | Updating a controller already running firmware 6.0+ |
+| `AcomControl-3.0-macOS.zip` | macOS app, universal, macOS 13+ |
+
+```bash
+# new controller
+esptool.py --chip esp32s3 --baud 921600 write_flash 0x0 AcomControl-7.0-esp32s3-full.bin
+
+# existing controller
+curl -F "firmware=@AcomControl-7.0-esp32s3-ota.bin" http://acomcontrol.local/api/ota
+```
+
+The macOS app is signed with a Developer ID certificate but is **not notarized**,
+so Gatekeeper blocks it on first launch: right-click the app and choose *Open*,
+or `xattr -dr com.apple.quarantine /Applications/AcomControl.app`.
+
+> **Update the firmware before the app.** v3.0 of the app relies on the
+> controller decoding fault codes and reporting their severity, which firmware
+> 6.0 and earlier do not do.
+
 ---
 
 ## macOS Application
