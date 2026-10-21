@@ -1,5 +1,11 @@
 # AcomControl - macOS Application
 
+> **Note — partially superseded.** This document describes the pre-6.0 firmware /
+> pre-2.0 app. Hardware, wiring and protocol sections remain accurate; the UI,
+> feature lists and API examples do not. See [CHANGELOG.md](../CHANGELOG.md) and
+> the rewritten [API_DOCUMENTATION.md](../Arduino%20(ESP32)%20code/API_DOCUMENTATION.md).
+
+
 **Professional macOS application for ACOM 600S Amplifier control via ESP32-S3 controller**
 
 ![Platform](https://img.shields.io/badge/platform-macOS%2013.0+-blue)
@@ -21,17 +27,27 @@
 - TX/RX status indication with color coding
 
 ### Control Capabilities
-- **Mode Control**: Standby, Operate RX, Power Off
-- **Band Selection**: All HF bands (160m - 10m)
-- **Antenna Selection**: Switch between Antenna 1 and 2
-- **Error Management**: Display and clear amplifier errors
+- **Mode Control**: Standby, Operate, Power Off
+- **Band Selection**: 160m – 6m (60m shares the 40m filter, band code 3)
+- **Antenna Selection**: Antennas 1–10, with a pending indicator until the
+  amplifier confirms the switch
+- **Hot-switching guard**: band and antenna changes under RF ask first, and the
+  controller refuses them without that confirmation
+- **Fault Management**: 126 fault codes named and classified from the ACOM
+  RS-232 specification, with the amplifier's own warning / soft / hard
+  severity; clear soft faults from the app
 
 ### Network Features
-- **Automatic Discovery**: Scan local network for ESP32 controllers
-- **Manual IP Entry**: Direct connection via IP address
-- **Connection Management**: Automatic reconnection with exponential backoff
-- **WiFi Configuration**: Configure ESP32 WiFi settings from the app
-- **System Information**: View ESP32 performance metrics
+- **Automatic Discovery**: Bonjour (`_acom._tcp`), with a subnet sweep for
+  controllers running firmware older than 6.0
+- **Manual IP Entry**: Direct connection via IP address or `.local` name
+- **Connection Management**: Automatic reconnection with backoff
+- **Authentication**: HTTP Basic credentials stored per controller in your login
+  keychain, with a prompt when a controller answers 401
+- **WiFi and Access Configuration**: Set the controller's network, hostname, API
+  password and access point passphrase from the app
+- **System Information**: Controller diagnostics, and a warning banner when a
+  controller is left unprotected
 
 ### User Interface
 - **Native SwiftUI**: Modern, responsive macOS interface
@@ -147,7 +163,7 @@ Once connected, you'll see:
 - Click **"Power Off"** to power down the amplifier
 
 #### Change Band
-- Click any band button (160m through 10m)
+- Click any band button (160m through 6m)
 - The active band will be highlighted in purple
 
 #### Change Antenna
@@ -191,10 +207,10 @@ The ESP32 broadcasts telemetry at **10Hz** in JSON format:
 ```json
 {
   "connected": true,
-  "mode": "OPR-RX",
-  "modeCode": 6,
+  "mode": "OPR",
+  "modeCode": 96,
   "band": "20m",
-  "bandCode": 6,
+  "bandCode": 5,
   "antenna": 2,
   "isTx": false,
   "forwardPower": 0,
@@ -204,13 +220,24 @@ The ESP32 broadcasts telemetry at **10Hz** in JSON format:
   "inputPower": 0,
   "current": 0,
   "frequency": 14200,
-  "fanSpeed": 35,
+  "fanLevel": 1,
+  "fanLevelMax": 4,
+  "fanSpeed": 25,
   "hvVoltage": 3200,
+  "errorCode": 0,
+  "errorSeverity": "",
+  "errorIsHardFault": false,
   "errors": [],
   "serialNumber": "600S12345678",
   "lastUpdate": 123456789
 }
 ```
+
+`bandCode` is 1–10 and `modeCode` is the raw telemetry mode byte, whose high
+nibble carries the state (`0x60` = OPR/RX, `0x70` = OPR/TX). `errors` holds
+decoded fault code numbers; `temperature` is degrees Kelvin, `swr` is ×100.
+See [API_DOCUMENTATION.md](../Arduino%20(ESP32)%20code/API_DOCUMENTATION.md)
+for the full schema.
 
 ### Sending Commands
 
@@ -221,9 +248,10 @@ Commands are sent as JSON messages:
 {"cmd": "setMode", "mode": 6}
 ```
 
-**Set Band**:
+**Set Band** (20m is code 5; add `"force": true` to override the
+transmit guard):
 ```json
-{"cmd": "setBand", "band": 6, "antenna": 2}
+{"cmd": "setBand", "band": 5, "antenna": 2}
 ```
 
 **Clear Errors**:

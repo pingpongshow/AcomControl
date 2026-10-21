@@ -1,5 +1,19 @@
 # AcomControl
 
+![The built-in web interface](web_ui.png)
+
+The controller serves this page itself — no app required. Shown here mid-transmission
+with an active soft fault, which the controller names and classifies from the
+specification's own fault table.
+
+> **Scope.** Hardware, wiring and first-run instructions here are current. The
+> band codes and the API examples have been corrected for firmware 7.0, but this
+> is the overview document — for the full API, including authentication,
+> `/api/faults` and the fault code table, see
+> [API_DOCUMENTATION.md](API_DOCUMENTATION.md), and for what changed and why see
+> [CHANGELOG.md](../CHANGELOG.md).
+
+
 ESP32-S3 based web interface controller for ACOM 600S RF amplifiers.
 
 ## Overview
@@ -10,10 +24,17 @@ AcomControl provides a wireless web-based interface for monitoring and controlli
 
 - **Real-time Monitoring**: Forward power, reflected power, SWR, temperature, current, and input power
 - **Mode Control**: Switch between Standby, Operate, and Power Off modes
-- **Band Selection**: Quick band switching (160m - 6m)
-- **WebSocket Updates**: Low-latency real-time updates at 10Hz
+- **Band Selection**: Quick band switching (160m – 6m; 60m shares the 40m filter)
+- **Fault Decoding**: All 126 fault codes from the ACOM RS-232 specification,
+  named and classified as warning / soft fault / hard fault
+- **Hot-switching Guard**: Band and antenna changes under RF are refused unless
+  the caller confirms
+- **WebSocket Updates**: Low-latency real-time updates at 10Hz, with automatic
+  fallback to REST polling if the socket cannot be established
 - **REST API**: Full HTTP API for integration with external applications
-- **WiFi Connectivity**: Connect to existing network or use built-in access point
+- **Authentication**: Optional HTTP Basic across the UI, API, WebSocket and OTA
+- **WiFi Connectivity**: Connect to an existing network, or use the built-in
+  WPA2 access point
 - **Mobile Friendly**: Responsive design works on phones, tablets, and desktops
 
 ## Hardware Requirements
@@ -201,18 +222,17 @@ Set band and antenna.
 }
 ```
 
-**Band Values:**
+**Band Values** (1–10; 60m shares the 40m filter at code 3):
 - `1` - 160m
 - `2` - 80m
-- `3` - 60m
-- `4` - 40m
-- `5` - 30m
-- `6` - 20m
-- `7` - 17m
-- `8` - 15m
-- `9` - 12m
-- `10` - 10m
-- `11` - 6m
+- `3` - 40m / 60m
+- `4` - 30m
+- `5` - 20m
+- `6` - 17m
+- `7` - 15m
+- `8` - 12m
+- `9` - 10m
+- `10` - 6m
 
 #### POST /api/wifi
 

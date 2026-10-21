@@ -1,0 +1,19 @@
+# PlatformIO build output and resolved dependencies
+.pio/
+Arduino\ \(ESP32\)\ code/AcomControl/.pio/
+
+# Xcode build output and per-user state
+build/
+DerivedData/
+*.xcuserdatad/
+xcuserdata/
+*.xcuserstate
+
+# Built application bundles - these ship as release assets, not in the tree
+*.app/
+
+# macOS
+.DS_Store
+
+# PlatformIO writes a backup when it rewrites the component manifest
+*.orig

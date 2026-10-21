@@ -1,5 +1,11 @@
 # AcomControl - Quick Start Guide
 
+> **Note — partially superseded.** This document describes the pre-6.0 firmware /
+> pre-2.0 app. Hardware, wiring and protocol sections remain accurate; the UI,
+> feature lists and API examples do not. See [CHANGELOG.md](../CHANGELOG.md) and
+> the rewritten [API_DOCUMENTATION.md](../Arduino%20(ESP32)%20code/API_DOCUMENTATION.md).
+
+
 ## 5-Minute Setup
 
 ### Step 1: Open the Project in Xcode
@@ -53,7 +59,7 @@ You should now see real-time telemetry from your amplifier:
 - **Discover** (top-right): Scan network for ESP32 controllers
 - **Settings** (⚙️): Manual IP entry and WiFi configuration
 - **Mode Buttons**: Standby, Operate RX, Power Off
-- **Band Buttons**: 160m through 10m
+- **Band Buttons**: 160m through 6m
 - **Antenna Buttons**: Switch between Ant 1 and Ant 2
 
 ### Connection Status
@@ -90,7 +96,7 @@ You should now see real-time telemetry from your amplifier:
 - Click **"Power Off"** to power down
 
 ### Change Band
-- Click any band button (160m - 10m)
+- Click any band button (160m – 6m)
 - Active band is highlighted in purple
 
 ### Switch Antenna

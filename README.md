@@ -1,188 +1,247 @@
 # ACOM Amplifier Control System
 
-A complete wireless control solution for the ACOM RF amplifier, consisting of an ESP32-S3 hardware interface and a native macOS application.
-
-## System Overview
+Wireless control for the ACOM 600S RF amplifier: an ESP32-S3 serial bridge plus a
+native macOS application.
 
 ```
-┌─────────────────┐     RS-232      ┌─────────────────┐      WiFi       ┌─────────────────-┐
-│   ACOM          │◄───────────────►│    ESP32-S3     │◄───────────────►│   macOS App or   │
-│   Amplifier     │    9600 8N1     │   Controller    │   WebSocket     │   WebAcomControl │
-└─────────────────┘                 └─────────────────┘                 └─────────────────-┘
+┌─────────────────┐     RS-232      ┌─────────────────┐      WiFi       ┌─────────────────┐
+│   ACOM 600S     │◄───────────────►│    ESP32-S3     │◄───────────────►│   macOS App     │
+│   Amplifier     │    9600 8N1     │   Controller    │   WebSocket     │   AcomControl   │
+└─────────────────┘                 └─────────────────┘                 └─────────────────┘
+                                            │
+                                            ├── Web UI (any browser)
+                                            ├── REST API + SSE
+                                            └── mDNS: acomcontrol.local
 ```
 
-The ESP32-S3 acts as a bridge between the amplifier's serial protocol and modern network interfaces, providing real-time telemetry and control via WebSocket and REST APIs.
+**Firmware v7.0 · macOS app v3.0.** See [CHANGELOG.md](CHANGELOG.md) for what
+changed and why.
 
 ---
 
 ## macOS Application
 
-**AcomControl** is a native SwiftUI application providing professional monitoring and control of the ACOM amplifier.
+Native SwiftUI, macOS 13+.
+
+**Monitoring**
+- Arc gauges with peak-hold needles for forward power, SWR and PA temperature
+- 60-second sparklines under each gauge
+- Full-width transmit banner with live power and SWR while keyed
+- Band, frequency in MHz, antenna, and a warning when the rig's frequency implies
+  a different band than the selected low-pass filter
+- Twelve secondary telemetry readouts: reflected and drive power, drain current,
+  HV supply, fan level (0–4) and percentage, dissipation, DC input, VCC, LPF
+  channel
+
+**Control**
+- Standby / Operate / Power Off, with confirmation on Power Off
+- Bands 160m–6m in a grid that wraps to the window
+- Antenna 1–10 selector; band changes keep the selected antenna
+- Clear soft faults
+- Confirmation before changing band while transmitting
+
+**Faults**
+- Code, name and severity from the ACOM RS-232 specification's own table (126
+  codes), plus the parameter and the telemetry captured alongside it
+- Severity comes from the amplifier, not from guesswork: telemetry byte 70 says
+  whether the live code belongs to a hard fault
+- Optional override table for your own wording (Settings → Alerts)
+
+**Alerts** — notifications and sound for high SWR, overtemperature, faults and
+disconnection, with hysteresis so a sustained condition produces one banner.
+
+**Session** — peak and average power, peak SWR and temperature, transmit time,
+transmission count, duty cycle. History window with Swift Charts, CSV export, and
+import of the controller's own stored telemetry.
+
+**Menu bar extra** — TX state, power, SWR and temperature, plus Standby/Operate/
+Clear, without keeping the window in front.
+
+**Networking** — Bonjour discovery, subnet sweep fallback, multiple saved
+controllers with auto-connect, manual address entry, Wi-Fi configuration.
+
+**Shortcuts** — ⌘1 Standby · ⌘2 Operate · ⇧⌘K Clear Faults · ⌘D Disconnect ·
+⌘R Reconnect · ⌘E Export CSV · ⌘, Settings
+
+### Build
+
+```bash
+open "Mac OSX (Xcode) app/AcomControl.xcodeproj"
+```
+
+Build and run (⌘R). Signing uses the team already in the project; change it under
+Signing & Capabilities if you are not on that team.
+
+---
+
+## ESP32-S3 Firmware
+
+### Hardware
+
+- ESP32-S3-DevKitC-1 (8 MB flash; N8/N8R2/N8R8/N16R8 all work)
+- MAX3232 or equivalent RS-232 level converter
+- DB9 cable to the amplifier's RS-232 port
+
+| ESP32-S3 | Level converter |
+|---|---|
+| GPIO16 | RX (from amplifier TX) |
+| GPIO17 | TX (to amplifier RX) |
+| 3V3 | VCC |
+| GND | GND |
+
+### Build and flash
+
+```bash
+cd "Arduino (ESP32) code/AcomControl"
+pio run -t upload
+```
+
+Once v6.0 or later is running, updates can go over the air — uncomment `upload_protocol`
+and `upload_port` in `platformio.ini`, or upload `firmware.bin` from the web UI.
+
+> **4 MB boards:** `platformio.ini` uses `default_8MB.csv` because LittleFS
+> logging plus OTA does not fit the 1.31 MB app slot in `default.csv`. On a 4 MB
+> board switch to `min_spiffs.csv` and lower `LOG_MAX_BYTES` in `src/main.cpp` to
+> about 128 KB.
+
+### First run
+
+With no Wi-Fi credentials stored, the controller starts a WPA2 access point:
+
+- **SSID** `AcomControl` → `http://192.168.4.1`
+- **Passphrase** generated on first boot and printed on the serial console at
+  115200 baud. Watch the console on first power-up, or read it back later at
+  `GET /api/config` once the controller is on your LAN.
+
+Set your network in the web UI or the macOS app, and it will reboot onto your
+LAN and be reachable at **`http://acomcontrol.local`**.
+
+Then **set an API password** (Access card in the web UI, or Settings ▸ Controller
+in the app). Without one the controller is open to everything on your network.
 
 ### Features
 
-- **Real-Time Monitoring** — 10Hz WebSocket updates for live telemetry
-  - Forward/Reflected Power with graphical meters
-  - SWR with color-coded warnings (green/yellow/red)
-  - PA Temperature monitoring
-  - Current, Voltage, Frequency display
-  
-- **Amplifier Control**
-  - Mode switching: Standby, Operate RX, Power Off
-  - Band selection: 160m through 10m
-  - Antenna switching (Ant 1 / Ant 2)
-  - Error display and clearing
+- 10 Hz WebSocket telemetry, 5 Hz SSE, full REST API — see
+  [API_DOCUMENTATION.md](Arduino%20(ESP32)%20code/API_DOCUMENTATION.md)
+- mDNS with an `_acom._tcp` service for zero-configuration discovery
+- OTA updates over espota or HTTP upload
+- Telemetry history in RAM plus a rotating CSV session log on flash
+- Automatic band following from the amplifier's frequency counter or from
+  rig-control software posting to `/api/frequency`
+- Optional HTTP Basic authentication across the web UI, REST, WebSocket, SSE and
+  firmware upload
+- The specification's fault code table served at `/api/faults`
+- Built-in responsive web UI with the same gauges as the macOS app
 
-- **Network Features**
-  - Automatic device discovery via mDNS/network scan
-  - Manual IP connection
-  - ESP32 WiFi configuration from the app
-  - Automatic reconnection with exponential backoff
+---
 
-- **Modern Interface**
-  - Native SwiftUI design
-  - Dark mode support
-  - Keyboard shortcuts
-  - Responsive layout
+## Security
 
-### OSX App Requirements
+This controller can key a 600 W amplifier onto an arbitrary band and accept
+arbitrary firmware, so treat network access to it as physical access to the
+amplifier.
 
-- macOS 13.0 (Ventura) or later
-- Xcode 15.0+ (for building from source)
-
-### Building
+**Set an API password.** With one set, firmware 7.0 requires HTTP Basic
+credentials on the web page, every `/api/*` endpoint, the WebSocket upgrade, the
+SSE stream and firmware upload:
 
 ```bash
-cd AcomControl
-open AcomControl.xcodeproj
-# Select your development team in Signing & Capabilities
-# Press Cmd+R to build and run
+curl -u acom:secret -X POST http://acomcontrol.local/api/config \
+  -H 'Content-Type: application/json' -d '{"apiPassword":"secret"}'
 ```
 
-### Quick Start
+The macOS app keeps its copy in your login keychain and prompts when a
+controller answers 401. The web UI and `GET /api/system` both report
+`authEnabled: false` until you set one.
 
-1. Launch the application
-2. Click **Discover** to scan for ESP32 controllers, or
-3. Click **Settings** (⚙️) to enter an IP address manually
-4. Once connected, the status indicator turns green and telemetry begins streaming
+**The access point has a WPA2 passphrase**, generated on first boot and kept in
+NVS. Setting `apPassword` to an empty string deliberately reopens it; anything
+else must be 8 characters or more.
+
+**What this does not protect against.** Basic auth over plain HTTP means the
+password is readable by anyone who can sniff the network — WPA2 is what provides
+confidentiality. There is no TLS, no rate limiting and no lockout. This raises
+the bar from "anyone in radio range" to "anyone with the password"; it is not a
+substitute for keeping the controller off hostile networks.
+
+> **Changed in firmware 7.0.** v6.0 had no authentication at all and ran its
+> access point with no passphrase.
 
 ---
 
-## ESP32-S3 Controller
+## Repository layout
 
-The ESP32 firmware provides the hardware interface to the ACOM amplifier and exposes network APIs for remote control.
-
-### Features
-
-- **ACOM Protocol Implementation** — Full support for the ACOM serial protocol
-  - Automatic telemetry parsing (message 0x2F)
-  - Command transmission with proper checksums
-  - Error code decoding
-  
-- **Network Interfaces**
-  - WebSocket server (`/ws`) for real-time bidirectional communication (available on port 80 of the ESP device IP)
-  - REST API for status and control
-  - Server-Sent Events (`/api/telemetry`) for streaming updates
-  - Built-in web interface for browser-based monitoring
-
-- **WiFi Modes**
-  - **Station Mode** — Connects to existing WiFi network
-  - **AP Mode** — Creates its own network when no credentials configured
-    - SSID: `AcomControl`
-    - IP: `192.168.4.1`
-
-### Hardware Setup
-
-| ESP32-S3 Pin | Connection |
-|--------------|------------|
-| GPIO16 (RX)  | ACOM RS-232 TX (via level shifter) |
-| GPIO17 (TX)  | ACOM RS-232 RX (via level shifter) |
-| GND          | RS-232 Ground |
-
-**Note:** The ACOM uses RS-232 voltage levels (±12V). A level shifter (e.g., MAX3232) is required between the ESP32 (3.3V logic) and the amplifier.
-
-### API Reference
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/ws` | WebSocket | Real-time telemetry and commands |
-| `/api/status` | GET | Current amplifier state (JSON) |
-| `/api/mode` | POST | Set amplifier mode |
-| `/api/band` | POST | Set operating band |
-| `/api/wifi` | POST | Configure WiFi credentials |
-| `/api/system` | GET | ESP32 system information |
-
-### WebSocket Commands
-
-```json
-{"command": "setMode", "mode": "standby"}
-{"command": "setMode", "mode": "operateRx"}
-{"command": "setMode", "mode": "powerOff"}
-{"command": "setBand", "band": 7}
-{"command": "setAntenna", "antenna": 1}
-{"command": "clearErrors"}
-{"command": "saveWiFi", "ssid": "MyNetwork", "password": "secret"}
+```
+├── Arduino (ESP32) code/
+│   └── AcomControl/
+│       ├── platformio.ini
+│       └── src/
+│           ├── main.cpp        firmware
+│           └── web_page.h      built-in web UI (PROGMEM)
+├── Mac OSX (Xcode) app/
+│   └── AcomControl/
+│       ├── Models.swift              wire formats, faults, history, stats
+│       ├── AmplifierController.swift connection, commands, session state
+│       ├── NotificationManager.swift alerts
+│       ├── FaultCodes.swift          generated fault table (see tools/)
+│       ├── Credentials.swift         per-controller keychain credentials
+│       ├── Gauges.swift              arc gauges, sparklines, tiles
+│       ├── ContentView.swift         main window
+│       ├── HistoryView.swift         charts, statistics, CSV export
+│       ├── MenuBarView.swift         menu bar extra
+│       ├── SettingsView.swift        settings
+│       └── DiscoveryView.swift       Bonjour + subnet discovery
+├── tools/
+│   └── gen_faults.py                 generates both fault tables from one source
+├── CHANGELOG.md
+└── ACOM_500S_User_Manual_EN_04_2023_3b3b.pdf   reference only - see note below
 ```
 
-### Telemetry Data
+### A note on the amplifier model
 
-The ESP32 broadcasts JSON telemetry at 10Hz:
+Everything here targets the **ACOM 600S**, which is what `ACOM Protocol.pdf`
+describes: it reports amplifier type 1 = A600S, and its bias fields are marked
+`(A600S)`. The gauge full-scale values assume it too — 600 W forward power in
+both the web page (`MAX_FWD`) and the app (`range: 0...600`).
 
-```json
-{
-  "connected": true,
-  "mode": "OPR/RX",
-  "modeCode": 96,
-  "band": "20m",
-  "forwardPower": 0,
-  "reflectedPower": 0,
-  "swr": 100,
-  "temperature": 298,
-  "inputPower": 0,
-  "current": 0,
-  "frequency": 14200,
-  "fanSpeed": 1,
-  "hvVoltage": 480,
-  "errors": []
-}
-```
+The 500S manual in this directory is reference material for the shared parts of
+the protection system, not the target. **On a different model, change those
+full-scale values** — the protocol is the same but 600 W is not.
 
-**Units:**
-- `temperature` — Kelvin (subtract 273 for Celsius)
-- `swr` — Multiplied by 100 (e.g., 150 = 1.50:1)
-- `inputPower` — Multiplied by 10 (e.g., 253 = 25.3W)
-- `hvVoltage` — Multiplied by 10 (e.g., 480 = 48.0V)
+### Regenerating the fault table
 
-### Building the Firmware
-
-The ESP32 firmware uses PlatformIO:
+The fault code table lives in one place, `tools/gen_faults.py`, which writes both
+the firmware's `acom_faults.h` and the app's `FaultCodes.swift`. Edit the Python
+source and re-run it rather than editing either generated file:
 
 ```bash
-cd ACOMESP32
-pio run                    # Build
-pio run -t upload          # Upload to connected ESP32
-pio device monitor         # Serial monitor (115200 baud)
+python3 tools/gen_faults.py .
 ```
 
-Further ESP32 documentation, including detailed setup and configuration, is available in the ACOMESP32 directory.
+## Troubleshooting
 
----
+**The app finds no controllers.** Bonjour needs firmware 6.0+. For older
+firmware use *Scan Subnet*, or type the address directly. Confirm the controller
+answers: `curl http://acomcontrol.local/api/system`.
 
-## Protocol Notes
+**Connected, but "no amp".** The app reached the ESP32 but the ESP32 is not
+getting valid RS-232 frames. Check TX/RX are not swapped, the level converter has
+power, and the amplifier's RS-232 port is enabled.
 
-The system implements the ACOM serial protocol as documented in `ACOM_Protocol.pdf`:
+**Wrong band selected.** Update to firmware v7.0. v6.0 shifted every band code
+from 40m upwards by one, so asking for 40m selected 30m and asking for 20m
+selected 17m — and because it applied the same shift in reverse when reading the
+band back, the display agreed with the button while the amplifier sat on the
+wrong low-pass filter. v5.0 had the matching read-side version of the same bug.
 
-- **Baud Rate:** 9600, 8N1
-- **Start Byte:** 0x55
-- **Checksum:** `256 - (SUM of bytes 0 to N-1) & 0xFF`
-- **Main Telemetry:** Message 0x2F (72 bytes, sent automatically at ~10Hz)
-- **Commands:** Message 0x81 (8 bytes)
+**Fan reads about a quarter of what it should.** Update to firmware v7.0. The
+amplifier's fan level runs 0–4; v6.0 scaled the percentage by 15.
 
----
+**Fault codes show as hex with no name.** Update both the firmware and the app to
+v7.0 / v3.0. The code-to-text table is in `Arduino (ESP32) code/ACOM Protocol.pdf`
+and is now built into both — v6.0 shipped no table at all, and v2.0 of the app
+asked you to supply your own.
 
-## License
-
-MIT License — See individual component directories for details.
-
-## Disclaimer
-Use this code and the app at your own risk - damage to your hardware from use will not be my responsibility, you use this code and app at your own risk.
+**Fault numbers look nonsensical** (`0x0080`, `0x0100`). Update to firmware
+v7.0. Message 0x21 is a bitfield; v6.0 published its raw 16-bit words as if they
+were code values.

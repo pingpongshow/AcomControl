@@ -13,6 +13,13 @@
 		AA0000007 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000008 /* SettingsView.swift */; };
 		AA0000009 /* DiscoveryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010 /* DiscoveryView.swift */; };
 		AA0000011 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AA0000012 /* Assets.xcassets */; };
+		AA0000031 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000030 /* Models.swift */; };
+		AA0000033 /* Gauges.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000032 /* Gauges.swift */; };
+		AA0000035 /* HistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000034 /* HistoryView.swift */; };
+		AA0000037 /* MenuBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000036 /* MenuBarView.swift */; };
+		AA0000039 /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000038 /* NotificationManager.swift */; };
+		AA0000041 /* FaultCodes.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000040 /* FaultCodes.swift */; };
+		AA0000043 /* Credentials.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000042 /* Credentials.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -25,6 +32,13 @@
 		AA0000013 /* AcomControl.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AcomControl.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA0000014 /* AcomControl.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = AcomControl.entitlements; sourceTree = "<group>"; };
 		AA0000024 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		AA0000030 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		AA0000032 /* Gauges.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Gauges.swift; sourceTree = "<group>"; };
+		AA0000034 /* HistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryView.swift; sourceTree = "<group>"; };
+		AA0000036 /* MenuBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarView.swift; sourceTree = "<group>"; };
+		AA0000038 /* NotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
+		AA0000040 /* FaultCodes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FaultCodes.swift; sourceTree = "<group>"; };
+		AA0000042 /* Credentials.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Credentials.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -50,8 +64,15 @@
 			isa = PBXGroup;
 			children = (
 				AA0000002 /* AcomControlApp.swift */,
-				AA0000004 /* ContentView.swift */,
+				AA0000030 /* Models.swift */,
 				AA0000006 /* AmplifierController.swift */,
+				AA0000038 /* NotificationManager.swift */,
+				AA0000040 /* FaultCodes.swift */,
+				AA0000042 /* Credentials.swift */,
+				AA0000032 /* Gauges.swift */,
+				AA0000004 /* ContentView.swift */,
+				AA0000034 /* HistoryView.swift */,
+				AA0000036 /* MenuBarView.swift */,
 				AA0000008 /* SettingsView.swift */,
 				AA0000010 /* DiscoveryView.swift */,
 				AA0000012 /* Assets.xcassets */,
@@ -138,6 +159,13 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA0000031 /* Models.swift in Sources */,
+				AA0000033 /* Gauges.swift in Sources */,
+				AA0000035 /* HistoryView.swift in Sources */,
+				AA0000037 /* MenuBarView.swift in Sources */,
+				AA0000039 /* NotificationManager.swift in Sources */,
+				AA0000041 /* FaultCodes.swift in Sources */,
+				AA0000043 /* Credentials.swift in Sources */,
 				AA0000003 /* ContentView.swift in Sources */,
 				AA0000005 /* AmplifierController.swift in Sources */,
 				AA0000007 /* SettingsView.swift in Sources */,
@@ -275,20 +303,17 @@
 				CODE_SIGN_ENTITLEMENTS = AcomControl/AcomControl.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = 64L6B86X7S;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = AcomControl/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = AcomControl;
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.acomcontrol.AcomControl;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -304,20 +329,17 @@
 				CODE_SIGN_ENTITLEMENTS = AcomControl/AcomControl.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = 64L6B86X7S;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = AcomControl/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = AcomControl;
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.acomcontrol.AcomControl;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;

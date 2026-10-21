@@ -2,401 +2,446 @@
 //  DiscoveryView.swift
 //  AcomControl
 //
+//  Finds controllers by Bonjour first (firmware v6.0 advertises _acom._tcp),
+//  falling back to a subnet sweep for older firmware.
+//
 
 import SwiftUI
+import Network
+
+struct DiscoveredDevice: Identifiable, Equatable {
+    let id: String            // host, so repeat sightings coalesce
+    let host: String
+    let displayHost: String   // hostname when Bonjour supplied one
+    let chipModel: String?
+    let firmwareVersion: String?
+    let serialNumber: String?
+    let rssi: Int?
+    let viaBonjour: Bool
+
+    static func == (lhs: DiscoveredDevice, rhs: DiscoveredDevice) -> Bool { lhs.id == rhs.id }
+}
 
 struct DiscoveryView: View {
     @EnvironmentObject var controller: AmplifierController
-    @StateObject private var discoveryManager = NetworkDiscoveryManager()
+    @StateObject private var discovery = NetworkDiscoveryManager()
     @Environment(\.dismiss) private var dismiss
-    
+
+    @State private var manualHost = ""
+
     var body: some View {
         VStack(spacing: 0) {
-            // Header
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Discover ESP32 Controllers")
-                        .font(.system(size: 20, weight: .semibold))
-                    Text("Scanning local network for AcomControl devices")
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Connect to a Controller")
+                        .font(.system(size: 18, weight: .semibold))
+                    Text(discovery.statusText)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Done") {
-                    discoveryManager.stopScan()
-                    dismiss()
-                }
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
             }
-            .padding(20)
-            .background(Color(NSColor.controlBackgroundColor))
-            
-            // Content
-            VStack(spacing: 20) {
-                // Scan controls
-                HStack {
-                    if discoveryManager.isScanning {
-                        ProgressView()
-                            .scaleEffect(0.8)
-                        Text("Scanning... (\(discoveryManager.scannedCount)/254)")
-                            .font(.system(size: 13))
-                            .foregroundColor(.secondary)
-                    } else {
-                        Button(action: {
-                            discoveryManager.startScan()
-                        }) {
-                            Label("Scan Network", systemImage: "magnifyingglass")
+            .padding(18)
+            .background(Color(nsColor: .controlBackgroundColor))
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    savedSection
+                    foundSection
+                    manualSection
+                }
+                .padding(18)
+            }
+        }
+        .frame(minWidth: 620, idealWidth: 660, minHeight: 520, idealHeight: 600)
+        .onAppear { discovery.start() }
+        .onDisappear { discovery.stop() }
+    }
+
+    // MARK: Sections
+
+    @ViewBuilder
+    private var savedSection: some View {
+        if !controller.devices.devices.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Saved")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+
+                ForEach(controller.devices.devices) { device in
+                    HStack(spacing: 12) {
+                        Image(systemName: "star.fill")
+                            .foregroundStyle(.yellow)
+                            .frame(width: 22)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(device.displayName)
+                                .font(.system(size: 13, weight: .semibold))
+                            HStack(spacing: 8) {
+                                Text(device.host)
+                                if let sn = device.serialNumber, sn != "Unknown" {
+                                    Text("S/N \(sn)")
+                                }
+                                if let seen = device.lastSeen {
+                                    Text(seen, style: .relative) + Text(" ago")
+                                }
+                            }
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Forget") { controller.devices.remove(device) }
+                            .buttonStyle(.link)
+                        Button("Connect") {
+                            controller.connect(to: device.host)
+                            dismiss()
                         }
                         .buttonStyle(.borderedProminent)
                     }
-                    
-                    Spacer()
-                    
-                    if discoveryManager.isScanning {
-                        Button("Stop Scan") {
-                            discoveryManager.stopScan()
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-                .padding(.horizontal, 20)
-                .padding(.top, 20)
-                
-                // Results
-                if discoveryManager.discoveredDevices.isEmpty && !discoveryManager.isScanning {
-                    VStack(spacing: 12) {
-                        Image(systemName: "network.slash")
-                            .font(.system(size: 48))
-                            .foregroundColor(.secondary)
-                        
-                        Text("No devices found")
-                            .font(.system(size: 16, weight: .medium))
-                        
-                        Text("Click 'Scan Network' to search for ESP32 controllers")
-                            .font(.system(size: 12))
-                            .foregroundColor(.secondary)
-                            .multilineTextAlignment(.center)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 12) {
-                            ForEach(discoveryManager.discoveredDevices) { device in
-                                DeviceRow(device: device) {
-                                    controller.connect(to: device.ipAddress)
-                                    dismiss()
-                                }
-                            }
-                        }
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 12)
-                    }
-                }
-                
-                // Network info
-                if let subnet = discoveryManager.currentSubnet {
-                    HStack {
-                        Image(systemName: "info.circle")
-                            .foregroundColor(.secondary)
-                        Text("Scanning subnet: \(subnet).x")
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 12)
+                    .padding(12)
+                    .background(CardBackground())
                 }
             }
         }
-        .frame(width: 600, height: 500)
-        .onDisappear {
-            discoveryManager.stopScan()
+    }
+
+    @ViewBuilder
+    private var foundSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("On this network")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if discovery.isScanning {
+                    ProgressView()
+                        .controlSize(.small)
+                    Button("Stop") { discovery.stop() }
+                        .buttonStyle(.link)
+                } else {
+                    Button("Scan Subnet") { discovery.startSubnetScan() }
+                        .buttonStyle(.link)
+                        .help("Probe every address on the local /24 for older firmware without Bonjour")
+                }
+            }
+
+            if discovery.isScanning && discovery.scanTotal > 0 {
+                ProgressView(value: Double(discovery.scanCompleted),
+                             total: Double(discovery.scanTotal))
+                    .progressViewStyle(.linear)
+            }
+
+            if discovery.devices.isEmpty {
+                VStack(spacing: 9) {
+                    Image(systemName: discovery.isScanning ? "antenna.radiowaves.left.and.right" : "network.slash")
+                        .font(.system(size: 34))
+                        .foregroundStyle(.tertiary)
+                    Text(discovery.isScanning ? "Looking for controllers…" : "No controllers found")
+                        .font(.system(size: 13, weight: .medium))
+                    Text("Firmware 6.0 and later announces itself over Bonjour. For older firmware, use Scan Subnet or type the address below.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 380)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 26)
+            } else {
+                ForEach(discovery.devices) { device in
+                    DeviceRow(device: device) {
+                        controller.connect(to: device.host)
+                        dismiss()
+                    }
+                }
+            }
         }
+    }
+
+    private var manualSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Manual")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            HStack {
+                TextField("192.168.4.1 or acomcontrol.local", text: $manualHost)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(connectManually)
+                Button("Connect", action: connectManually)
+                    .disabled(manualHost.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button("AP Mode") {
+                    controller.connect(to: "192.168.4.1")
+                    dismiss()
+                }
+                .help("Connect to the controller's own access point at 192.168.4.1")
+            }
+        }
+        .padding(12)
+        .background(CardBackground())
+    }
+
+    private func connectManually() {
+        let host = manualHost.trimmingCharacters(in: .whitespaces)
+        guard !host.isEmpty else { return }
+        controller.connect(to: host)
+        dismiss()
     }
 }
 
 struct DeviceRow: View {
     let device: DiscoveredDevice
     let onConnect: () -> Void
-    
+
     var body: some View {
-        HStack(spacing: 15) {
-            // Icon
+        HStack(spacing: 13) {
             ZStack {
-                Circle()
-                    .fill(Color.blue.opacity(0.2))
-                    .frame(width: 44, height: 44)
-                
-                Image(systemName: "network")
-                    .font(.system(size: 20))
-                    .foregroundColor(.blue)
+                Circle().fill(Color.blue.opacity(0.18)).frame(width: 38, height: 38)
+                Image(systemName: device.viaBonjour ? "bonjour" : "network")
+                    .font(.system(size: 16))
+                    .foregroundStyle(.blue)
             }
-            
-            // Device info
-            VStack(alignment: .leading, spacing: 4) {
-                Text("ESP32-S3 Controller")
-                    .font(.system(size: 14, weight: .semibold))
-                
-                HStack(spacing: 12) {
-                    Label(device.ipAddress, systemImage: "network")
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
-                    
-                    if let model = device.chipModel {
-                        Label(model, systemImage: "chip")
-                            .font(.system(size: 12))
-                            .foregroundColor(.secondary)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(device.displayHost)
+                    .font(.system(size: 13, weight: .semibold))
+
+                HStack(spacing: 9) {
+                    Text(device.host)
+                    if let model = device.chipModel { Text(model) }
+                    if let version = device.firmwareVersion { Text("v\(version)") }
+                    if let sn = device.serialNumber, !sn.isEmpty, sn != "Unknown" {
+                        Text("S/N \(sn)")
                     }
-                    
-                    if let serialNumber = device.serialNumber, !serialNumber.isEmpty, serialNumber != "Unknown" {
-                        Label(serialNumber, systemImage: "number")
-                            .font(.system(size: 12))
-                            .foregroundColor(.secondary)
-                    }
+                    if let rssi = device.rssi, rssi != 0 { Text("\(rssi) dBm") }
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+            Button("Connect", action: onConnect)
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(12)
+        .background(CardBackground())
+        .accessibilityElement(children: .combine)
+    }
+}
+
+// MARK: - Discovery manager
+
+@MainActor
+final class NetworkDiscoveryManager: ObservableObject {
+    @Published private(set) var devices: [DiscoveredDevice] = []
+    @Published private(set) var isScanning = false
+    @Published private(set) var scanCompleted = 0
+    @Published private(set) var scanTotal = 0
+    @Published private(set) var subnet: String?
+    @Published private(set) var bonjourActive = false
+
+    private var browser: NWBrowser?
+    private var scanTask: Task<Void, Never>?
+    private let maxConcurrentProbes = 32
+
+    var statusText: String {
+        if isScanning, scanTotal > 0 {
+            return "Scanning \(subnet ?? "local").0/24 — \(scanCompleted) of \(scanTotal) probed"
+        }
+        if bonjourActive { return "Listening for controllers via Bonjour" }
+        return "\(devices.count) controller\(devices.count == 1 ? "" : "s") found"
+    }
+
+    // MARK: Bonjour
+
+    func start() {
+        guard browser == nil else { return }
+
+        let parameters = NWParameters()
+        parameters.includePeerToPeer = false
+        let descriptor = NWBrowser.Descriptor.bonjourWithTXTRecord(type: "_acom._tcp", domain: nil)
+        let browser = NWBrowser(for: descriptor, using: parameters)
+
+        browser.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor in
+                switch state {
+                case .ready:  self?.bonjourActive = true
+                case .failed, .cancelled: self?.bonjourActive = false
+                default: break
                 }
             }
-            
-            Spacer()
-            
-            // Connect button
-            Button("Connect") {
-                onConnect()
+        }
+
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            Task { @MainActor in
+                for result in results { self?.resolve(result) }
             }
-            .buttonStyle(.borderedProminent)
         }
-        .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color(NSColor.controlBackgroundColor))
-                .shadow(color: .black.opacity(0.05), radius: 5, y: 2)
-        )
+
+        browser.start(queue: .main)
+        self.browser = browser
     }
-}
 
-// MARK: - Network Discovery Manager
-
-struct DiscoveredDevice: Identifiable {
-    let id = UUID()
-    let ipAddress: String
-    let chipModel: String?
-    let serialNumber: String?
-    let rssi: Int?
-}
-
-class NetworkDiscoveryManager: ObservableObject {
-    @Published var discoveredDevices: [DiscoveredDevice] = []
-    @Published var isScanning = false
-    @Published var scannedCount = 0
-    @Published var currentSubnet: String?
-    
-    private var scanTask: Task<Void, Never>?
-    private let maxConcurrentScans = 50 // Limit concurrent network requests
-    
-    func startScan() {
-        // Cancel any existing scan
-        stopScan()
-        
-        discoveredDevices.removeAll()
-        isScanning = true
-        scannedCount = 0
-        
-        // Get current subnet
-        currentSubnet = getCurrentSubnet()
-        
-        scanTask = Task {
-            await scanNetwork()
-        }
-    }
-    
-    func stopScan() {
+    func stop() {
+        browser?.cancel()
+        browser = nil
+        bonjourActive = false
         scanTask?.cancel()
         scanTask = nil
-        DispatchQueue.main.async {
-            self.isScanning = false
-        }
+        isScanning = false
     }
-    
-    private func scanNetwork() async {
-        guard let subnet = currentSubnet else {
-            await MainActor.run {
-                isScanning = false
-            }
-            return
-        }
-        
-        await withTaskGroup(of: DiscoveredDevice?.self) { group in
-            var activeTaskCount = 0
-            
-            for i in 1...254 {
-                // Check if cancelled
-                if Task.isCancelled {
-                    break
-                }
-                
-                let ip = "\(subnet).\(i)"
-                
-                // Limit concurrent tasks
-                if activeTaskCount >= maxConcurrentScans {
-                    // Wait for one to complete
-                    if let device = await group.next() {
-                        activeTaskCount -= 1
-                        if let device = device {
-                            await addDevice(device)
-                        }
+
+    private func resolve(_ result: NWBrowser.Result) {
+        guard case .service(let name, _, _, _) = result.endpoint else { return }
+
+        // The service name is the controller's mDNS hostname, so `<name>.local`
+        // is directly usable — no address resolution round trip needed.
+        let host = "\(name).local"
+        Task { await probe(host: host, displayHost: name, viaBonjour: true) }
+    }
+
+    // MARK: Subnet sweep (older firmware without mDNS)
+
+    func startSubnetScan() {
+        scanTask?.cancel()
+        guard let prefix = Self.currentSubnetPrefix() else { return }
+
+        subnet = prefix
+        isScanning = true
+        scanCompleted = 0
+        scanTotal = 254
+
+        scanTask = Task { [weak self] in
+            guard let self else { return }
+            let concurrency = self.maxConcurrentProbes
+            await withTaskGroup(of: Void.self) { group in
+                var inFlight = 0
+                for host in 1...254 {
+                    if Task.isCancelled { break }
+                    if inFlight >= concurrency {
+                        await group.next()
+                        inFlight -= 1
                     }
+                    let address = "\(prefix).\(host)"
+                    group.addTask { [weak self] in
+                        await self?.probe(host: address, displayHost: address, viaBonjour: false)
+                        // Progress counts probes that have *finished*. The old
+                        // version incremented as tasks were launched, so the bar
+                        // hit 254/254 instantly and then sat there.
+                        await self?.noteProbeCompleted()
+                    }
+                    inFlight += 1
                 }
-                
-                group.addTask {
-                    await self.checkDevice(at: ip)
-                }
-                activeTaskCount += 1
-                
-                await MainActor.run {
-                    self.scannedCount = i
-                }
+                await group.waitForAll()
             }
-            
-            // Collect remaining results
-            for await device in group {
-                if let device = device {
-                    await addDevice(device)
-                }
-            }
-        }
-        
-        await MainActor.run {
-            isScanning = false
+            await MainActor.run { self.isScanning = false }
         }
     }
-    
-    private func checkDevice(at ipAddress: String) async -> DiscoveredDevice? {
-        guard let url = URL(string: "http://\(ipAddress)/api/system") else {
-            return nil
-        }
-        
+
+    private func noteProbeCompleted() {
+        scanCompleted += 1
+    }
+
+    // MARK: Probing
+
+    private func probe(host: String, displayHost: String, viaBonjour: Bool) async {
+        guard let url = URL(string: "http://\(host)/api/system") else { return }
+
         var request = URLRequest(url: url)
-        request.timeoutInterval = 1.5
+        request.timeoutInterval = viaBonjour ? 4.0 : 1.5
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200 else {
-                return nil
-            }
-            
-            let apiResponse = try JSONDecoder().decode(APIResponse<SystemInfo>.self, from: data)
-            
-            guard apiResponse.success, let systemInfo = apiResponse.data else {
-                return nil
-            }
-            
-            // Also try to get serial number from status endpoint
-            var serialNumber: String? = nil
-            if let statusURL = URL(string: "http://\(ipAddress)/api/status") {
-                do {
-                    var statusRequest = URLRequest(url: statusURL)
-                    statusRequest.timeoutInterval = 1.0
-                    statusRequest.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-                    let (statusData, _) = try await URLSession.shared.data(for: statusRequest)
-                    let statusResponse = try JSONDecoder().decode(APIResponse<AmplifierState>.self, from: statusData)
-                    serialNumber = statusResponse.data?.serialNumber
-                } catch {
-                    // Ignore error, serial number is optional
-                }
-            }
-            
-            return DiscoveredDevice(
-                ipAddress: ipAddress,
-                chipModel: systemInfo.chipModel,
-                serialNumber: serialNumber,
-                rssi: systemInfo.rssi
-            )
-        } catch {
-            // Not an ESP32 or not responding
-            return nil
-        }
-    }
-    
-    @MainActor
-    private func addDevice(_ device: DiscoveredDevice) {
-        if !discoveredDevices.contains(where: { $0.ipAddress == device.ipAddress }) {
-            discoveredDevices.append(device)
-            // Sort by IP address numerically
-            discoveredDevices.sort { lhs, rhs in
-                let lhsParts = lhs.ipAddress.split(separator: ".").compactMap { Int($0) }
-                let rhsParts = rhs.ipAddress.split(separator: ".").compactMap { Int($0) }
-                
-                for (l, r) in zip(lhsParts, rhsParts) {
-                    if l != r {
-                        return l < r
-                    }
-                }
-                return false
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              // Tolerates both the v6.0 envelope and the bare v5.0 object, so a
+              // controller that has not been updated yet still shows up.
+              let info = try? APIDecoder.payload(SystemInfo.self, from: data)
+        else { return }
+
+        // A random web server on the LAN will not carry these fields.
+        guard info.chipModel.hasPrefix("ESP32") else { return }
+
+        var serial: String? = nil
+        if let statusURL = URL(string: "http://\(host)/api/status") {
+            var statusRequest = URLRequest(url: statusURL)
+            statusRequest.timeoutInterval = 2.0
+            statusRequest.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            if let (statusData, _) = try? await URLSession.shared.data(for: statusRequest),
+               let state = try? APIDecoder.payload(AmplifierState.self, from: statusData) {
+                serial = state.serialNumber
             }
         }
+
+        add(DiscoveredDevice(
+            id: host,
+            host: host,
+            displayHost: viaBonjour ? displayHost : (info.hostname.isEmpty ? host : info.hostname),
+            chipModel: info.chipModel,
+            firmwareVersion: info.firmwareVersion == "—" ? nil : info.firmwareVersion,
+            serialNumber: serial,
+            rssi: info.rssi,
+            viaBonjour: viaBonjour
+        ))
     }
-    
-    private func getCurrentSubnet() -> String? {
-        // Try to detect current network subnet
-        var address: String?
+
+    private func add(_ device: DiscoveredDevice) {
+        if let index = devices.firstIndex(where: { $0.id == device.id }) {
+            devices[index] = device
+        } else {
+            devices.append(device)
+        }
+        // Bonjour results first, then numerically by address.
+        devices.sort { lhs, rhs in
+            if lhs.viaBonjour != rhs.viaBonjour { return lhs.viaBonjour }
+            return Self.sortKey(lhs.host) < Self.sortKey(rhs.host)
+        }
+    }
+
+    private static func sortKey(_ host: String) -> String {
+        let parts = host.split(separator: ".")
+        guard parts.count == 4, parts.allSatisfy({ Int($0) != nil }) else { return host }
+        return parts.map { String(format: "%03d", Int($0) ?? 0) }.joined()
+    }
+
+    // MARK: Interface inspection
+
+    /// First non-loopback, non-link-local IPv4 address on a real interface.
+    static func currentSubnetPrefix() -> String? {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        
-        guard getifaddrs(&ifaddr) == 0 else {
-            return "192.168.1" // Default fallback
-        }
-        
+        guard getifaddrs(&ifaddr) == 0 else { return nil }
         defer { freeifaddrs(ifaddr) }
-        
-        var ptr = ifaddr
-        while ptr != nil {
-            defer { ptr = ptr?.pointee.ifa_next }
-            
-            guard let interface = ptr?.pointee else { continue }
-            let addrFamily = interface.ifa_addr.pointee.sa_family
-            
-            if addrFamily == UInt8(AF_INET) {
-                let name = String(cString: interface.ifa_name)
-                
-                // Check for active network interfaces (WiFi or Ethernet)
-                if name == "en0" || name == "en1" || name.hasPrefix("en") {
-                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    let result = getnameinfo(
-                        interface.ifa_addr,
-                        socklen_t(interface.ifa_addr.pointee.sa_len),
-                        &hostname,
-                        socklen_t(hostname.count),
-                        nil,
-                        socklen_t(0),
-                        NI_NUMERICHOST
-                    )
-                    
-                    if result == 0 {
-                        let detectedAddress = String(cString: hostname)
-                        // Skip loopback
-                        if !detectedAddress.hasPrefix("127.") && !detectedAddress.hasPrefix("169.254.") {
-                            address = detectedAddress
-                            break
-                        }
-                    }
-                }
+
+        var pointer = ifaddr
+        while let current = pointer {
+            defer { pointer = current.pointee.ifa_next }
+
+            guard let addr = current.pointee.ifa_addr,
+                  addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+
+            let name = String(cString: current.pointee.ifa_name)
+            guard name.hasPrefix("en") || name.hasPrefix("bridge") else { continue }
+
+            var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(addr, socklen_t(addr.pointee.sa_len),
+                              &buffer, socklen_t(buffer.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+
+            let address = String(cString: buffer)
+            guard !address.hasPrefix("127."), !address.hasPrefix("169.254.") else { continue }
+
+            let octets = address.split(separator: ".")
+            if octets.count == 4 {
+                return "\(octets[0]).\(octets[1]).\(octets[2])"
             }
         }
-        
-        if let address = address {
-            let components = address.split(separator: ".")
-            if components.count == 4 {
-                return "\(components[0]).\(components[1]).\(components[2])"
-            }
-        }
-        
-        // Default to common private network
-        return "192.168.1"
+        return nil
     }
 }
 
-struct DiscoveryView_Previews: PreviewProvider {
-    static var previews: some View {
-        DiscoveryView()
-            .environmentObject(AmplifierController())
-    }
+#Preview {
+    DiscoveryView()
+        .environmentObject(AmplifierController())
+        .environmentObject(AppRouter())
 }

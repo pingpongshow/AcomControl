@@ -1,188 +1,263 @@
-# AcomControl ESP32-S3 API Documentation
-## External Application Integration Guide
+# AcomControl ESP32-S3 API
 
-This document provides comprehensive information for building desktop applications (Windows/macOS) that interface with the AcomControl ESP32-S3 controller.
+Firmware **v7.0** — ACOM 600S amplifier controller.
 
----
+The controller exposes three interfaces over the same port 80:
 
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Network Configuration](#network-configuration)
-3. [REST API Reference](#rest-api-reference)
-4. [WebSocket Protocol](#websocket-protocol)
-5. [Server-Sent Events (SSE)](#server-sent-events-sse)
-6. [Data Models](#data-models)
-7. [Example Code](#example-code)
-8. [Best Practices](#best-practices)
-9. [Troubleshooting](#troubleshooting)
+| Interface | Path | Use |
+|---|---|---|
+| REST | `/api/*` | One-shot reads and commands |
+| WebSocket | `/ws` | 10 Hz telemetry stream and low-latency commands |
+| Server-Sent Events | `/api/telemetry` | 5 Hz telemetry stream, one-way |
 
 ---
 
-## Overview
+## Finding the controller
 
-The ESP32-S3 controller exposes multiple interfaces for external application control:
+Firmware 6.0 and later runs an mDNS responder:
 
-- **REST API**: Request/response for commands and status queries
-- **WebSocket**: Bidirectional real-time communication (10Hz updates)
-- **Server-Sent Events (SSE)**: Unidirectional telemetry streaming (5Hz updates)
+- **Hostname** — `http://acomcontrol.local` (configurable via `/api/config`)
+- **Services** — `_http._tcp` and `_acom._tcp` on port 80
 
-All interfaces support **CORS** for cross-origin requests from desktop applications.
+The `_acom._tcp` service carries TXT records `version`, `model` and `path`, so a
+client can identify a controller without probing. Browsing for `_acom._tcp` is
+the recommended discovery method; a subnet sweep of `/api/system` still works
+for controllers that have not been updated.
 
-### Performance Characteristics
+**AP fallback**: with no Wi-Fi credentials stored, the controller starts an
+access point named `AcomControl` at `192.168.4.1`. Firmware 7.0 generates a
+random WPA2 passphrase for it on first boot, keeps it in NVS, prints it on the
+serial console at every boot and reports it at `GET /api/config`, so it can
+always be recovered from the station-mode side.
 
-- **Telemetry Update Rate**: 10Hz (every 100ms)
-- **WebSocket Broadcast**: 10Hz (every 100ms)
-- **SSE Broadcast**: 5Hz (every 200ms)
-- **API Response Time**: <50ms typical
-- **Dual-Core Processing**: Serial on Core 0, Network on Core 1
+## Authentication
 
----
+Set `apiPassword` via `POST /api/config` and the controller requires HTTP Basic
+credentials on the web page, every `/api/*` endpoint, the WebSocket upgrade, the
+SSE stream and firmware upload. `CORS` preflight (`OPTIONS`) is never
+challenged. The user name defaults to `acom` and is settable as `apiUser`.
 
-## Network Configuration
-
-### Finding the Controller
-
-**AP Mode** (default):
-- SSID: `AcomControl`
-- Password: `acom1234`
-- IP Address: `192.168.4.1`
-
-**Station Mode** (connected to WiFi):
-- IP Address: Assigned by DHCP (check router or serial console)
-- Access via local network
-
-### Configuring WiFi
-
-**Via Web Interface**:
-```
-http://[IP_ADDRESS]/
-```
-Enter SSID and password in the WiFi Configuration section.
-
-**Via API**:
 ```bash
-curl -X POST http://192.168.4.1/api/wifi \
-  -H "Content-Type: application/json" \
-  -d '{"ssid":"YourNetwork","password":"YourPassword"}'
+curl -u acom:secret http://acomcontrol.local/api/status
 ```
+
+With no `apiPassword` set, the API stays open — upgrading does not lock anyone
+out of their own controller — but `GET /api/system` then reports
+`"authEnabled": false` and `"apOpen"` tells you whether the access point is
+unprotected too, so a client can say so.
+
+> Basic, not Digest: this is a LAN device on plain HTTP, so Digest would protect
+> the password on the wire and nothing else. Treat the password as readable by
+> anyone sniffing the network and rely on WPA2 for confidentiality.
+
+> **Fixed in firmware 7.0.** v6.0 had no authentication of any kind and ran its
+> access point wide open, so anyone within radio range could key a 600 W
+> amplifier onto an arbitrary band or flash arbitrary firmware.
 
 ---
 
-## REST API Reference
+## Response envelope
 
-All REST endpoints return JSON with CORS headers enabled.
-
-### Base URL
-
-```
-http://[ESP32_IP_ADDRESS]/api
-```
-
-### Response Format
-
-All API responses follow this structure:
+**Every** REST response uses this shape. Firmware v5.0 returned bare objects with
+different key names, which broke conforming clients — v6.0 matches this document.
 
 ```json
 {
   "success": true,
   "timestamp": 123456789,
-  "data": { ... },
-  "error": "Error message if success=false"
+  "data": { }
 }
 ```
 
----
+On failure:
 
-### GET /api/status
-
-Get current amplifier state (snapshot).
-
-**Request**:
-```http
-GET /api/status HTTP/1.1
-Host: 192.168.4.1
+```json
+{
+  "success": false,
+  "timestamp": 123456789,
+  "error": "Invalid band"
+}
 ```
 
-**Response**:
+`timestamp` is `millis()` since controller boot, not wall-clock time.
+
+CORS is open (`Access-Control-Allow-Origin: *`) and `OPTIONS` preflight is handled
+on every `/api/*` path.
+
+---
+
+## Units
+
+Telemetry is reported in the amplifier's **raw wire units**. Clients scale them.
+This keeps the controller free of lossy intermediate rounding.
+
+| Field | Raw unit | To convert |
+|---|---|---|
+| `swr` | ×100 | `swr / 100` → 130 = 1.30:1 |
+| `temperature` | Kelvin | `temperature - 273` → °C |
+| `inputPower` | ×10 W | `inputPower / 10` → W |
+| `current` | mA | `current / 1000` → A |
+| `hvVoltage` | ×10 V | `hvVoltage / 10` → V |
+| `vcc5` | mV | `vcc5 / 1000` → V |
+| `vcc26` | ×10 V | `vcc26 / 10` → V |
+| `pdcPower`, `disPower` | ×10 W | `/ 10` → W |
+| `forwardPower`, `reflectedPower` | W | none |
+| `frequency` | kHz | none |
+
+`fanSpeed` is the exception: the amplifier reports a fan level in the upper
+nibble of telemetry byte 69, documented in section 3.4.8 as **`[0..4]`**, and
+the controller publishes the raw `fanLevel`, the maximum `fanLevelMax` (4) and a
+derived `fanSpeed` percentage.
+
+> **Fixed in firmware 7.0.** v5.0 published the raw level under the name
+> `fanSpeed`, so clients rendered "3%" for a fan at full speed. v6.0 added a
+> percentage but divided by 15 instead of 4, so a fan at full speed reported
+> 27%. Clients should scale by `fanLevelMax` rather than assuming a constant.
+
+---
+
+## Band codes
+
+Two numbering schemes exist and the controller translates between them:
+
+| Code | Band | Frequency range |
+|------|------|-----------------|
+| 1 | 160m | 1.8–2.0 MHz |
+| 2 | 80m | 3.5–4.0 MHz |
+| 3 | 40m / 60m | 7.0–7.3 MHz, 5.25–5.45 MHz |
+| 4 | 30m | 10.1–10.15 MHz |
+| 5 | 20m | 14.0–14.35 MHz |
+| 6 | 17m | 18.068–18.168 MHz |
+| 7 | 15m | 21.0–21.45 MHz |
+| 8 | 12m | 24.89–24.99 MHz |
+| 9 | 10m | 28.0–29.7 MHz |
+| 10 | 6m | 50.0–54.0 MHz |
+
+There is **one** band numbering, shared by the amplifier, the low-pass filter
+channel in telemetry byte 69, the REST and WebSocket API, and both user
+interfaces. No conversion happens anywhere.
+
+Section 5.1 of `ACOM Protocol.pdf` fixes it twice over: command `0x09` ("manual
+changing of antenna and band") documents its band parameter as `0x01 - 0x0A`,
+and the command `0x0C` band-select relay test spells the ten bands out in
+order, `0x01` = 160m through `0x0A` = 6m.
+
+60m has no band number of its own. Section 3.3.7 byte 13 groups it with 40m
+("Antenna Assigment and Selectivity for Bands 40m and 60m"), so 5 MHz operation
+uses the 40m low-pass filter and band code 3.
+
+> **Fixed in firmware 7.0.** v6.0 believed the amplifier used an eleven-slot
+> numbering with 60m at 3, and converted between that and the UI. The result was
+> that every band from 40m upwards selected the next band up — asking for 40m
+> gave 30m, asking for 20m gave 17m — and 6m sent `0x0B`, outside the documented
+> range. The matching reverse conversion on message 0x27 hid it, so the display
+> agreed with the button while the amplifier sat on the wrong filter.
+
+---
+
+## GET /api/status
+
+Current amplifier telemetry.
+
 ```json
 {
   "success": true,
   "timestamp": 123456789,
   "data": {
     "connected": true,
-    "mode": "STB",
-    "modeCode": 5,
+    "mode": "OPR",
+    "modeCode": 96,
     "band": "20m",
-    "bandCode": 6,
+    "bandCode": 5,
     "antenna": 2,
+    "antennaType": 1,
     "isTx": false,
     "forwardPower": 0,
     "reflectedPower": 0,
-    "swr": 1.05,
-    "temperature": 28.5,
-    "inputPower": 0.0,
-    "current": 0.0,
+    "swr": 105,
+    "temperature": 301,
+    "inputPower": 0,
+    "current": 0,
     "frequency": 14200,
-    "fanSpeed": 35,
+    "fanLevel": 2,
+    "fanSpeed": 50,
+    "fanLevelMax": 4,
     "hvVoltage": 3200,
-    "errors": [],
+    "vcc5": 5020,
+    "vcc26": 262,
+    "pdcPower": 0,
+    "disPower": 0,
+    "lpfChannel": 5,
+    "errorCode": 13,
+    "errorParam": 265,
+    "errorSeverity": "soft",
+    "errorIsHardFault": false,
+    "errors": [13, 4],
     "serialNumber": "600S12345678",
-    "lastUpdate": 123456700
+    "lastUpdate": 123456700,
+    "msgCount": 48210,
+    "autoBandFollow": false
   }
 }
 ```
 
-**Example (JavaScript)**:
-```javascript
-fetch('http://192.168.4.1/api/status')
-  .then(response => response.json())
-  .then(data => {
-    if (data.success) {
-      console.log('Amplifier mode:', data.data.mode);
-      console.log('Forward power:', data.data.forwardPower, 'W');
-    }
-  });
-```
+`connected` reports the **amplifier's** serial link, not your HTTP connection.
+It goes false after 5 s without a valid frame on the RS-232 port.
 
-**Example (Python)**:
-```python
-import requests
+`errors` lists the **fault codes** that are currently active, decoded from
+message 0x21, which the controller polls every 2 s. `errorCode` is the code on
+the amplifier's own screen, with `errorParam` as its parameter and
+`errorSeverity` (`"warning"`, `"soft"` or `"hard"`) as the amplifier's own
+classification of it — taken from telemetry byte 70 bit 0 and the specification's
+table, so no client has to guess severity from telemetry.
 
-response = requests.get('http://192.168.4.1/api/status')
-data = response.json()
+Names for every code are served by [GET /api/faults](#get-apifaults), so clients
+need no table of their own.
 
-if data['success']:
-    print(f"Mode: {data['data']['mode']}")
-    print(f"Power: {data['data']['forwardPower']}W")
-```
-
-**Example (C#)**:
-```csharp
-using System.Net.Http;
-using System.Text.Json;
-
-var client = new HttpClient();
-var response = await client.GetStringAsync("http://192.168.4.1/api/status");
-var data = JsonSerializer.Deserialize<ApiResponse>(response);
-
-if (data.Success) {
-    Console.WriteLine($"Mode: {data.Data.Mode}");
-}
-```
+> **Fixed in firmware 7.0.** Message 0x21 is a **bitfield**, not a list of code
+> values: section 3.4.1 defines ten 16-bit words where bit *n* of word *k* means
+> code `(k × 16) + n` is active. v6.0 copied the ten raw words into `errors` and
+> published them as if they were codes, so one active "excessive drive power"
+> fault (code `0x07`, word 0 bit 7) appeared as fault `0x0080`.
 
 ---
 
-### GET /api/system
+## GET /api/faults
 
-Get ESP32-S3 system information and performance metrics.
+The fault code table from section 3.4.1 of the ACOM RS-232 specification: 126
+named codes, each with the severity the specification assigns it. Static for a
+given firmware build, so fetch it once and cache it.
 
-**Request**:
-```http
-GET /api/system HTTP/1.1
+```json
+{
+  "success": true,
+  "timestamp": 123456789,
+  "data": {
+    "count": 126,
+    "codes": {
+      "0": { "severity": "warning", "text": "Hot switching attempt" },
+      "7": { "severity": "soft", "text": "Excessive drive power" },
+      "13": { "severity": "soft", "text": "PA load SWR too high" },
+      "16": { "severity": "hard", "text": "5 V too low" }
+    }
+  }
+}
 ```
 
-**Response**:
+Keys are decimal code numbers, as strings. `severity` is one of `warning`
+(transmission continues), `soft` (the amplifier reverts to standby) or `hard`
+(the amplifier shuts its supply down). A handful of codes are left unnamed by
+the specification and are absent from this table.
+
+> **New in firmware 7.0.** v6.0 shipped no table and told operators the
+> specification was unavailable. It is `ACOM Protocol.pdf`, in this directory.
+
+---
+
+## GET /api/system
+
+Controller diagnostics.
+
 ```json
 {
   "success": true,
@@ -193,962 +268,293 @@ GET /api/system HTTP/1.1
     "cpuFreqMHz": 240,
     "flashSize": 8388608,
     "freeHeap": 234567,
-    "psramSize": 2097152,
-    "psramFree": 1800000,
+    "heapSize": 327680,
+    "psramSize": 0,
+    "psramFree": 0,
     "uptime": 123456789,
     "wifiMode": "STA",
     "wifiSSID": "MyNetwork",
     "ipAddress": "192.168.1.100",
     "rssi": -45,
+    "hostname": "acomcontrol",
+    "firmwareVersion": "7.0",
+    "telemetryEnabled": true,
+    "autoBandFollow": false,
+    "loggingEnabled": true,
+    "historyCount": 600,
+    "historyCapacity": 600,
+    "logBytes": 40960,
+    "fanLevelMax": 4,
+    "authEnabled": false,
+    "apOpen": false,
     "performance": {
-      "wsUpdateCount": 12345,
-      "sseUpdateCount": 6789,
+      "wsUpdateCount": 51234,
+      "sseUpdateCount": 1200,
       "serialRxCount": 98765,
       "wsClients": 1,
-      "sseClients": 1
+      "sseClients": 0
     }
   }
 }
 ```
 
+`uptime` is **milliseconds** since boot.
+
 ---
 
-### POST /api/mode
+## POST /api/mode
 
-Set amplifier operating mode.
+```json
+{ "mode": 5 }
+```
 
-**Request**:
-```http
-POST /api/mode HTTP/1.1
-Content-Type: application/json
+| Code | Mode |
+|---|---|
+| 1, 2 | Restart |
+| 3 | Debug |
+| 4 | Service |
+| 5 | Standby |
+| 6 | Operate (RX) |
+| 7 | Operate (TX) |
+| 8 | ATAC |
+| 9 | Menu |
+| 10 | Power off |
 
+Codes outside 1–10 are rejected with HTTP 400.
+
+---
+
+## POST /api/band
+
+```json
+{ "band": 5, "antenna": 2 }
+```
+
+`band` is a display code 1–10. `antenna` is 1–10 and **optional** — when omitted
+the controller keeps the antenna the amplifier currently reports rather than
+forcing antenna 1.
+
+---
+
+## POST /api/frequency
+
+Feeds a transceiver frequency from rig-control software (Hamlib, N1MM, Node-RED).
+
+```json
+{ "frequency": 14250 }
+```
+
+`frequency` is in kHz, 1–65535. Response includes the band it maps to and
+whether automatic band following is enabled:
+
+```json
+{ "success": true, "timestamp": 1, "data": { "frequency": 14250, "band": 5, "autoBandFollow": true } }
+```
+
+The value is retained for 10 s. It is used for band following only when the
+amplifier's own frequency counter reads zero, so a keyed reading always wins.
+
+Example with `rigctl`:
+
+```bash
+while true; do
+  KHZ=$(( $(rigctl -m 2 f) / 1000 ))
+  curl -s -X POST http://acomcontrol.local/api/frequency \
+       -H 'Content-Type: application/json' -d "{\"frequency\":$KHZ}" > /dev/null
+  sleep 2
+done
+```
+
+---
+
+## GET / POST /api/config
+
+```json
 {
-  "mode": 6
+  "hostname": "acomcontrol",
+  "autoBandFollow": false,
+  "logging": true,
+  "otaPasswordSet": false,
+  "wifiSSID": "MyNetwork",
+  "apMode": false,
+  "apSSID": "AcomControl",
+  "apPassword": "qm4xr7tkbd",
+  "apOpen": false,
+  "authEnabled": false,
+  "apiUser": "acom"
 }
 ```
 
-**Mode Values**:
-- `1` - RESET
-- `2` - INIT
-- `3` - DEBUG
-- `4` - SERVICE
-- `5` - STB (Standby)
-- `6` - OPR-RX (Operate Receive)
-- `7` - OPR-TX (Operate Transmit)
-- `8` - ATAC
-- `9` - MENU
-- `10` - OFF (Power Off)
+`wifiSSID` is the network the controller is configured to **join**, which is not
+the same thing as the network it is currently serving: `apSSID` is the setup
+access point's own name, and `apMode` says which of the two is in use.
 
-**Response**:
+> **Fixed in firmware 7.0.** v6.0 reported the access point's own name in
+> `wifiSSID` whenever it was in AP mode, so the web form offered to make the
+> controller join itself and the macOS app had to special-case the string
+> `"AcomControl"`.
+
+POST accepts any subset of `autoBandFollow`, `logging`, `hostname`,
+`otaPassword`, `apiUser`, `apiPassword` and `apPassword`. Everything except
+`autoBandFollow` and `logging` reboots the controller; the response reports
+`"rebooting": true` and is delivered before the restart.
+
+`apPassword` must be 8 characters or more (a WPA2 minimum) or empty, which
+deliberately reopens the access point. An empty `apiPassword` disables
+authentication.
+
+**Automatic band following** changes bands to match the operating frequency. It
+never fires while the amplifier is transmitting, and it holds off 3 s between
+changes.
+
+---
+
+## POST /api/wifi
+
+```json
+{ "ssid": "MyNetwork", "password": "secret" }
+```
+
+An empty `password` is accepted for open networks. The controller replies first
+and reboots ~1 s later, so the client sees the success response. (v5.0 restarted
+inside the request handler, so the reply was usually lost.)
+
+---
+
+## GET /api/history
+
+Telemetry ring buffer held in RAM — 600 samples at 1 Hz, or 1800 with PSRAM.
+
+Optional `?points=N` limits the response to the newest N samples.
+
 ```json
 {
   "success": true,
-  "mode": 6,
-  "timestamp": 123456789
+  "timestamp": 123456789,
+  "data": {
+    "fields": ["t","forwardPower","reflectedPower","swr","temperature","current","frequency","band","tx"],
+    "count": 600,
+    "capacity": 600,
+    "samples": [
+      [120000, 480, 12, 130, 318, 24500, 14250, 5, 1],
+      [121000, 0, 0, 105, 315, 0, 14250, 5, 0]
+    ]
+  }
 }
 ```
 
-**Example (JavaScript)**:
-```javascript
-fetch('http://192.168.4.1/api/mode', {
-  method: 'POST',
-  headers: {'Content-Type': 'application/json'},
-  body: JSON.stringify({mode: 6})
-})
-.then(r => r.json())
-.then(data => console.log('Mode set:', data.success));
+Samples are arrays in `fields` order, oldest first. `t` is `millis()` at capture.
+Values use the same raw units as `/api/status`.
+
+## GET /api/history/download
+
+The rotating CSV session log from LittleFS, as a file download. Columns:
+`ms,forwardW,reflectedW,swr100,tempK,currentmA,freqkHz,band,tx`.
+
+Written every second while transmitting and every 30 s otherwise, to limit flash
+wear. Rotates to `acomlog.1.csv` at 384 KB.
+
+## POST /api/history/clear
+
+Empties both the RAM ring buffer and the flash log.
+
+---
+
+## POST /api/ota
+
+Firmware update by `multipart/form-data` upload of a `firmware.bin`.
+
+```bash
+curl -F "firmware=@.pio/build/esp32-s3-devkitc-1/firmware.bin" \
+     http://acomcontrol.local/api/ota
 ```
 
-**Example (Python)**:
-```python
-import requests
+The controller reboots ~1.5 s after a successful write. The serial task is
+suspended during the flash write and resumed if the update fails.
 
-response = requests.post(
-    'http://192.168.4.1/api/mode',
-    json={'mode': 6}
-)
-print(response.json())
+ArduinoOTA (espota) is also available:
+
+```bash
+pio run -t upload --upload-port acomcontrol.local
 ```
 
 ---
 
-### POST /api/band
+## POST /api/command
 
-Set band and antenna.
-
-**Request**:
-```http
-POST /api/band HTTP/1.1
-Content-Type: application/json
-
-{
-  "band": 6,
-  "antenna": 2
-}
-```
-
-**Band Values**:
-- `1` - 160m
-- `2` - 80m
-- `3` - 60m
-- `4` - 40m
-- `5` - 30m
-- `6` - 20m
-- `7` - 17m
-- `8` - 15m
-- `9` - 12m
-- `10` - 10m
-
-**Antenna Values**:
-- `1` - Antenna 1
-- `2` - Antenna 2 (default)
-
-**Response**:
-```json
-{
-  "success": true,
-  "band": 6,
-  "antenna": 2,
-  "timestamp": 123456789
-}
-```
+Generic endpoint accepting the same payloads as the WebSocket (below). Useful
+for scripting without a WebSocket client.
 
 ---
 
-### POST /api/command
+## WebSocket `/ws`
 
-Generic command interface for advanced operations.
+On connect the controller sends the current state immediately, then broadcasts
+at 10 Hz. **Telemetry frames are bare state objects, not enveloped** — they are
+the `data` object from `/api/status`.
 
-**Request**:
-```http
-POST /api/command HTTP/1.1
-Content-Type: application/json
+Broadcasts are skipped when any client's send queue is backed up, so a slow
+client cannot exhaust the controller's heap.
 
-{
-  "type": "reset"
-}
-```
+### Commands
 
-**Command Types**:
-- `"reset"` - Reset amplifier
-- `"clear_errors"` - Clear error codes
+Send JSON text frames:
 
-**Response**:
 ```json
-{
-  "success": true,
-  "command": "reset"
-}
-```
-
-**Example (Clear Errors)**:
-```javascript
-fetch('http://192.168.4.1/api/command', {
-  method: 'POST',
-  headers: {'Content-Type': 'application/json'},
-  body: JSON.stringify({type: 'clear_errors'})
-});
-```
-
----
-
-### POST /api/wifi
-
-Configure WiFi settings (requires reboot).
-
-**Request**:
-```http
-POST /api/wifi HTTP/1.1
-Content-Type: application/json
-
-{
-  "ssid": "MyNetwork",
-  "password": "MyPassword"
-}
-```
-
-**Response**:
-```json
-{
-  "success": true,
-  "message": "WiFi configured, rebooting..."
-}
-```
-
-**Note**: ESP32 will reboot after this command. Allow 10-15 seconds for reconnection.
-
----
-
-## WebSocket Protocol
-
-WebSocket provides **bidirectional** real-time communication with 10Hz updates.
-
-### Connection
-
-```javascript
-const ws = new WebSocket('ws://192.168.4.1/ws');
-```
-
-### Message Format
-
-**Server → Client** (State Updates):
-```json
-{
-  "connected": true,
-  "mode": "STB",
-  "modeCode": 5,
-  "band": "20m",
-  "bandCode": 6,
-  "antenna": 2,
-  "isTx": false,
-  "forwardPower": 0,
-  "reflectedPower": 0,
-  "swr": 100,
-  "temperature": 273,
-  "inputPower": 0,
-  "current": 0,
-  "frequency": 14200,
-  "fanSpeed": 35,
-  "hvVoltage": 3200,
-  "serialNumber": "600S12345678",
-  "lastUpdate": 123456789,
-  "errors": []
-}
-```
-
-**Client → Server** (Commands):
-
-Set Mode:
-```json
-{"cmd": "setMode", "mode": 6}
-```
-
-Set Band:
-```json
-{"cmd": "setBand", "band": 6, "antenna": 2}
-```
-
-Clear Errors:
-```json
+{"cmd": "setMode",     "mode": 5}
+{"cmd": "setBand",     "band": 5, "antenna": 2}
+{"cmd": "setAntenna",  "antenna": 2, "band": 5}
 {"cmd": "clearErrors"}
+{"cmd": "requestInfo"}
+{"cmd": "setFrequency","frequency": 14250}
+{"cmd": "saveWiFi",    "ssid": "MyNetwork", "password": "secret"}
 ```
 
-Save WiFi:
+A rejected command produces an envelope instead of a state frame:
+
 ```json
-{"cmd": "saveWiFi", "ssid": "Network", "password": "Pass"}
+{"success": false, "error": "Invalid band"}
 ```
 
-### Complete Example (JavaScript)
+Distinguish the two by the presence of `success`. A frame without `cmd` is
+rejected rather than dereferenced — in v5.0 it crashed the controller.
 
-```javascript
-const ws = new WebSocket('ws://192.168.4.1/ws');
-
-ws.onopen = () => {
-  console.log('Connected to AcomControl');
-};
-
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  console.log('Forward Power:', data.forwardPower, 'W');
-  console.log('SWR:', (data.swr / 100).toFixed(2));
-  
-  // Temperature conversion
-  const tempC = (data.temperature - 273) / 10;
-  console.log('Temperature:', tempC.toFixed(1), '°C');
-  
-  // Check TX state
-  if (data.isTx) {
-    console.log('TRANSMITTING');
-  }
-};
-
-ws.onerror = (error) => {
-  console.error('WebSocket error:', error);
-};
-
-ws.onclose = () => {
-  console.log('Disconnected');
-  // Implement reconnection logic
-  setTimeout(() => {
-    // Reconnect
-  }, 1000);
-};
-
-// Send command
-function setMode(mode) {
-  ws.send(JSON.stringify({cmd: 'setMode', mode}));
-}
-
-// Example: Set to Operate mode
-setMode(6);
-```
-
-### Complete Example (Python)
-
-```python
-import websocket
-import json
-import threading
-
-def on_message(ws, message):
-    data = json.loads(message)
-    print(f"Power: {data['forwardPower']}W")
-    print(f"SWR: {data['swr'] / 100:.2f}")
-    
-    # Temperature conversion
-    temp_c = (data['temperature'] - 273) / 10
-    print(f"Temperature: {temp_c:.1f}°C")
-    
-    if data['isTx']:
-        print("TRANSMITTING!")
-
-def on_error(ws, error):
-    print(f"Error: {error}")
-
-def on_close(ws, close_status_code, close_msg):
-    print("Connection closed")
-
-def on_open(ws):
-    print("Connected to AcomControl")
-    
-    # Send a command
-    ws.send(json.dumps({"cmd": "setMode", "mode": 6}))
-
-# Create WebSocket connection
-ws = websocket.WebSocketApp(
-    "ws://192.168.4.1/ws",
-    on_open=on_open,
-    on_message=on_message,
-    on_error=on_error,
-    on_close=on_close
-)
-
-# Run in separate thread
-wst = threading.Thread(target=ws.run_forever)
-wst.daemon = True
-wst.start()
-```
+Commands are queued and executed by the serial task, so a web request never
+blocks on the 9600 baud UART.
 
 ---
 
-## Server-Sent Events (SSE)
-
-SSE provides **unidirectional** real-time streaming at 5Hz (lower bandwidth than WebSocket).
-
-### Connection
-
-**URL**: `http://192.168.4.1/api/telemetry`
-
-### Event Format
-
-```
-event: state
-data: {"success":true,"timestamp":123456789,"data":{...}}
-id: 123456789
-```
-
-### JavaScript Example
+## SSE `/api/telemetry`
 
 ```javascript
-const eventSource = new EventSource('http://192.168.4.1/api/telemetry');
-
-eventSource.onmessage = (event) => {
-  const response = JSON.parse(event.data);
-  
-  if (response.success) {
-    const data = response.data;
-    console.log('Forward Power:', data.forwardPower, 'W');
-    console.log('Mode:', data.mode);
-    console.log('Band:', data.band);
-    
-    // Update UI elements
-    updatePowerMeter(data.forwardPower);
-    updateTemperature(data.temperature);
-  }
-};
-
-eventSource.onerror = (error) => {
-  console.error('SSE error:', error);
-  eventSource.close();
-  
-  // Reconnect after delay
-  setTimeout(() => {
-    // Create new EventSource
-  }, 5000);
-};
-
-function updatePowerMeter(power) {
-  // Update your UI
-  document.getElementById('power').textContent = power + ' W';
-}
-
-function updateTemperature(temp) {
-  const tempC = (temp - 273) / 10;
-  document.getElementById('temp').textContent = tempC.toFixed(1) + '°C';
-}
+const events = new EventSource('http://acomcontrol.local/api/telemetry');
+events.addEventListener('state', e => console.log(JSON.parse(e.data)));
 ```
 
-### Python Example
-
-```python
-import sseclient
-import requests
-import json
-
-def stream_telemetry():
-    url = 'http://192.168.4.1/api/telemetry'
-    response = requests.get(url, stream=True)
-    client = sseclient.SSEClient(response)
-    
-    for event in client.events():
-        data = json.loads(event.data)
-        
-        if data['success']:
-            amp_data = data['data']
-            print(f"Power: {amp_data['forwardPower']}W")
-            print(f"SWR: {amp_data['swr']:.2f}")
-            print(f"Mode: {amp_data['mode']}")
-            print("---")
-
-# Run streaming
-stream_telemetry()
-```
+Event name `state`, 5 Hz, same bare state object as the WebSocket.
 
 ---
 
-## Data Models
-
-### State Object
-
-```typescript
-interface AmplifierState {
-  connected: boolean;         // Amplifier connection status
-  mode: string;              // Mode name (e.g., "STB", "OPR-TX")
-  modeCode: number;          // Mode code (1-10)
-  band: string;              // Band name (e.g., "20m", "40m")
-  bandCode: number;          // Band code (1-10)
-  antenna: number;           // Antenna number (1-2)
-  isTx: boolean;             // Transmitting state
-  forwardPower: number;      // Forward power (watts)
-  reflectedPower: number;    // Reflected power (watts)
-  swr: number;               // SWR (1.00 - 3.00)
-  temperature: number;       // Temperature (celsius)
-  inputPower: number;        // Input power (watts)
-  current: number;           // Current (amps)
-  frequency: number;         // Frequency (kHz)
-  fanSpeed: number;          // Fan speed (0-100%)
-  hvVoltage: number;         // HV voltage (volts)
-  errors: number[];          // Error codes
-  serialNumber: string;      // Amplifier serial number
-  lastUpdate: number;        // Last update timestamp (millis)
-}
-```
-
-### System Info Object
-
-```typescript
-interface SystemInfo {
-  chipModel: string;         // "ESP32-S3"
-  chipRevision: number;      // Chip revision
-  cpuFreqMHz: number;        // CPU frequency (240 MHz)
-  flashSize: number;         // Flash size (bytes)
-  freeHeap: number;          // Free heap (bytes)
-  psramSize: number;         // PSRAM size (bytes)
-  psramFree: number;         // Free PSRAM (bytes)
-  uptime: number;            // Uptime (milliseconds)
-  wifiMode: string;          // "AP" or "STA"
-  wifiSSID: string;          // WiFi SSID
-  ipAddress: string;         // IP address
-  rssi: number;              // WiFi signal strength (dBm)
-  performance: {
-    wsUpdateCount: number;   // WebSocket update counter
-    sseUpdateCount: number;  // SSE update counter
-    serialRxCount: number;   // Serial messages received
-    wsClients: number;       // Connected WebSocket clients
-    sseClients: number;      // Connected SSE clients
-  }
-}
-```
-
----
-
-## Example Code
-
-### Complete Desktop Application Example (Electron/JavaScript)
-
-```javascript
-// main.js - Electron main process
-const { app, BrowserWindow } = require('electron');
-
-function createWindow() {
-  const win = new BrowserWindow({
-    width: 1200,
-    height: 800,
-    webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false
-    }
-  });
-  
-  win.loadFile('index.html');
-}
-
-app.whenReady().then(createWindow);
-```
-
-```html
-<!-- index.html -->
-<!DOCTYPE html>
-<html>
-<head>
-  <title>AcomControl Desktop</title>
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      background: #1a1a1a;
-      color: white;
-      padding: 20px;
-    }
-    .meter {
-      margin: 10px 0;
-      padding: 15px;
-      background: #2a2a2a;
-      border-radius: 8px;
-    }
-    .value {
-      font-size: 2em;
-      color: #4CAF50;
-    }
-    button {
-      padding: 10px 20px;
-      margin: 5px;
-      background: #4CAF50;
-      border: none;
-      color: white;
-      border-radius: 5px;
-      cursor: pointer;
-    }
-    button:hover {
-      background: #45a049;
-    }
-  </style>
-</head>
-<body>
-  <h1>AcomControl Desktop</h1>
-  
-  <div id="status">Connecting...</div>
-  
-  <div class="meter">
-    <div>Forward Power</div>
-    <div class="value" id="fwdPower">0 W</div>
-  </div>
-  
-  <div class="meter">
-    <div>SWR</div>
-    <div class="value" id="swr">1.00</div>
-  </div>
-  
-  <div class="meter">
-    <div>Temperature</div>
-    <div class="value" id="temp">0°C</div>
-  </div>
-  
-  <div>
-    <button onclick="setMode(5)">Standby</button>
-    <button onclick="setMode(6)">Operate</button>
-    <button onclick="setMode(10)">Power Off</button>
-  </div>
-  
-  <script>
-    const ESP32_IP = '192.168.4.1';
-    let ws;
-    
-    function connect() {
-      ws = new WebSocket(`ws://${ESP32_IP}/ws`);
-      
-      ws.onopen = () => {
-        document.getElementById('status').textContent = 'Connected';
-        document.getElementById('status').style.color = '#4CAF50';
-      };
-      
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        
-        document.getElementById('fwdPower').textContent = data.forwardPower + ' W';
-        document.getElementById('swr').textContent = (data.swr / 100).toFixed(2);
-        
-        const tempC = (data.temperature - 273) / 10;
-        document.getElementById('temp').textContent = tempC.toFixed(1) + '°C';
-      };
-      
-      ws.onclose = () => {
-        document.getElementById('status').textContent = 'Disconnected';
-        document.getElementById('status').style.color = '#f44336';
-        
-        setTimeout(connect, 1000);
-      };
-    }
-    
-    function setMode(mode) {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({cmd: 'setMode', mode}));
-      }
-    }
-    
-    connect();
-  </script>
-</body>
-</html>
-```
-
-### Python Desktop Application (tkinter)
-
-```python
-import tkinter as tk
-from tkinter import ttk
-import websocket
-import json
-import threading
-
-class AcomControlApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("AcomControl Desktop")
-        self.root.geometry("600x400")
-        self.root.configure(bg='#1a1a1a')
-        
-        # Connection status
-        self.status_label = tk.Label(root, text="Connecting...", 
-                                     bg='#1a1a1a', fg='yellow', font=('Arial', 12))
-        self.status_label.pack(pady=10)
-        
-        # Power display
-        self.power_frame = tk.Frame(root, bg='#2a2a2a', padx=20, pady=20)
-        self.power_frame.pack(fill='x', padx=10, pady=5)
-        
-        tk.Label(self.power_frame, text="Forward Power", 
-                bg='#2a2a2a', fg='white').pack()
-        self.power_label = tk.Label(self.power_frame, text="0 W", 
-                                   bg='#2a2a2a', fg='#4CAF50', font=('Arial', 24))
-        self.power_label.pack()
-        
-        # SWR display
-        self.swr_frame = tk.Frame(root, bg='#2a2a2a', padx=20, pady=20)
-        self.swr_frame.pack(fill='x', padx=10, pady=5)
-        
-        tk.Label(self.swr_frame, text="SWR", 
-                bg='#2a2a2a', fg='white').pack()
-        self.swr_label = tk.Label(self.swr_frame, text="1.00", 
-                                 bg='#2a2a2a', fg='#4CAF50', font=('Arial', 24))
-        self.swr_label.pack()
-        
-        # Temperature display
-        self.temp_frame = tk.Frame(root, bg='#2a2a2a', padx=20, pady=20)
-        self.temp_frame.pack(fill='x', padx=10, pady=5)
-        
-        tk.Label(self.temp_frame, text="Temperature", 
-                bg='#2a2a2a', fg='white').pack()
-        self.temp_label = tk.Label(self.temp_frame, text="0°C", 
-                                  bg='#2a2a2a', fg='#4CAF50', font=('Arial', 24))
-        self.temp_label.pack()
-        
-        # Control buttons
-        btn_frame = tk.Frame(root, bg='#1a1a1a')
-        btn_frame.pack(pady=20)
-        
-        tk.Button(btn_frame, text="Standby", command=lambda: self.set_mode(5),
-                 bg='#4CAF50', fg='white', padx=20, pady=10).pack(side='left', padx=5)
-        tk.Button(btn_frame, text="Operate", command=lambda: self.set_mode(6),
-                 bg='#FF9800', fg='white', padx=20, pady=10).pack(side='left', padx=5)
-        tk.Button(btn_frame, text="Power Off", command=lambda: self.set_mode(10),
-                 bg='#f44336', fg='white', padx=20, pady=10).pack(side='left', padx=5)
-        
-        # WebSocket
-        self.ws = None
-        self.connect_websocket()
-    
-    def connect_websocket(self):
-        def on_message(ws, message):
-            data = json.loads(message)
-            
-            # Update UI in main thread
-            self.root.after(0, self.update_display, data)
-        
-        def on_error(ws, error):
-            print(f"Error: {error}")
-        
-        def on_close(ws, close_status_code, close_msg):
-            self.root.after(0, self.status_label.config, 
-                          {'text': 'Disconnected', 'fg': 'red'})
-            # Reconnect after delay
-            self.root.after(1000, self.connect_websocket)
-        
-        def on_open(ws):
-            self.root.after(0, self.status_label.config, 
-                          {'text': 'Connected', 'fg': '#4CAF50'})
-        
-        self.ws = websocket.WebSocketApp(
-            "ws://192.168.4.1/ws",
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
-        
-        # Run WebSocket in separate thread
-        wst = threading.Thread(target=self.ws.run_forever)
-        wst.daemon = True
-        wst.start()
-    
-    def update_display(self, data):
-        self.power_label.config(text=f"{data['forwardPower']} W")
-        self.swr_label.config(text=f"{data['swr'] / 100:.2f}")
-        
-        temp_c = (data['temperature'] - 273) / 10
-        self.temp_label.config(text=f"{temp_c:.1f}°C")
-        
-        # Change color based on TX state
-        if data['isTx']:
-            self.power_label.config(fg='#ff5252')
-        else:
-            self.power_label.config(fg='#4CAF50')
-    
-    def set_mode(self, mode):
-        if self.ws and self.ws.sock and self.ws.sock.connected:
-            self.ws.send(json.dumps({"cmd": "setMode", "mode": mode}))
-
-# Run application
-root = tk.Tk()
-app = AcomControlApp(root)
-root.mainloop()
-```
-
----
-
-## Best Practices
-
-### 1. Connection Management
-
-**Always implement reconnection logic**:
-
-```javascript
-let reconnectAttempts = 0;
-const maxReconnectAttempts = 10;
-
-function connect() {
-  const ws = new WebSocket('ws://192.168.4.1/ws');
-  
-  ws.onclose = () => {
-    if (reconnectAttempts < maxReconnectAttempts) {
-      reconnectAttempts++;
-      const delay = Math.min(1000 * reconnectAttempts, 10000);
-      console.log(`Reconnecting in ${delay}ms...`);
-      setTimeout(connect, delay);
-    }
-  };
-  
-  ws.onopen = () => {
-    reconnectAttempts = 0; // Reset on successful connection
-  };
-}
-```
-
-### 2. Error Handling
-
-**Always handle API errors**:
-
-```javascript
-async function getStatus() {
-  try {
-    const response = await fetch('http://192.168.4.1/api/status');
-    
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-    
-    const data = await response.json();
-    
-    if (!data.success) {
-      console.error('API error:', data.error);
-      return null;
-    }
-    
-    return data.data;
-  } catch (error) {
-    console.error('Request failed:', error);
-    return null;
-  }
-}
-```
-
-### 3. Efficient Polling
-
-If using REST API instead of WebSocket, implement efficient polling:
-
-```javascript
-let pollInterval = null;
-
-function startPolling() {
-  // Poll every 500ms (maximum 2Hz to avoid overwhelming ESP32)
-  pollInterval = setInterval(async () => {
-    const status = await getStatus();
-    if (status) {
-      updateUI(status);
-    }
-  }, 500);
-}
-
-function stopPolling() {
-  if (pollInterval) {
-    clearInterval(pollInterval);
-    pollInterval = null;
-  }
-}
-```
-
-**Important**: Polling faster than 500ms (2Hz) is not recommended. Use WebSocket or SSE for higher update rates.
-
-### 4. UI Update Throttling
-
-Throttle UI updates to prevent excessive rendering:
-
-```javascript
-let lastUpdate = 0;
-const updateThreshold = 50; // 50ms = 20Hz max
-
-function updateUI(data) {
-  const now = Date.now();
-  if (now - lastUpdate < updateThreshold) {
-    return; // Skip this update
-  }
-  lastUpdate = now;
-  
-  // Update UI elements
-  document.getElementById('power').textContent = data.forwardPower + ' W';
-  // ...
-}
-```
-
-### 5. Data Validation
-
-Always validate incoming data:
-
-```javascript
-function isValidState(data) {
-  return (
-    typeof data.forwardPower === 'number' &&
-    typeof data.swr === 'number' &&
-    typeof data.mode === 'string' &&
-    data.forwardPower >= 0 &&
-    data.forwardPower <= 1000 &&
-    data.swr >= 0 &&
-    data.swr <= 500
-  );
-}
-
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  
-  if (isValidState(data)) {
-    updateUI(data);
-  } else {
-    console.warn('Invalid state data received');
-  }
-};
-```
-
-### 6. Network Discovery
-
-For automatic network discovery, implement mDNS/Bonjour or scan local network:
-
-```python
-import socket
-
-def find_esp32(subnet='192.168.1'):
-    """Scan subnet for ESP32 controller"""
-    for i in range(1, 255):
-        ip = f"{subnet}.{i}"
-        try:
-            response = requests.get(f"http://{ip}/api/system", timeout=0.5)
-            data = response.json()
-            if data.get('success') and data['data']['chipModel'] == 'ESP32-S3':
-                return ip
-        except:
-            continue
-    return None
-
-# Usage
-esp32_ip = find_esp32()
-if esp32_ip:
-    print(f"Found ESP32 at {esp32_ip}")
-```
-
----
-
-## Troubleshooting
-
-### Cannot Connect to ESP32
-
-1. **Check network connectivity**:
-   ```bash
-   ping 192.168.4.1
-   ```
-
-2. **Verify ESP32 is in correct WiFi mode**:
-   - Check serial console for IP address
-   - Verify WiFi credentials are correct
-
-3. **Check firewall settings**:
-   - Allow port 80 (HTTP)
-   - Allow WebSocket connections
-
-### WebSocket Disconnects Frequently
-
-1. **Disable WiFi power saving on ESP32** (already configured in code)
-2. **Check network stability**
-3. **Reduce update frequency** if needed
-4. **Implement robust reconnection logic**
-
-### API Returns Errors
-
-1. **Check CORS headers** in browser console
-2. **Verify JSON format** of POST requests
-3. **Check ESP32 serial console** for error messages
-
-### Slow Performance
-
-1. **Use WebSocket instead of polling REST API**
-2. **Reduce update frequency** if system is overloaded
-3. **Check ESP32 free heap** via `/api/system`
-4. **Limit number of concurrent connections**
-
-### Data Appears Incorrect
-
-1. **Apply correct conversions**:
-   - SWR: Divide by 100
-   - Temperature: `(value - 273) / 10` for Celsius
-   - Input Power: Divide by 10
-   - Current: Divide by 1000
-
-2. **Check `lastUpdate` timestamp** to ensure fresh data
-
----
-
-## Summary
-
-The ESP32-S3 controller provides three interfaces for external applications:
-
-| Interface | Update Rate | Use Case | Bidirectional |
-|-----------|------------|----------|---------------|
-| REST API | On-demand | Status queries, commands | No |
-| WebSocket | 10Hz | Real-time monitoring & control | Yes |
-| SSE | 5Hz | Real-time monitoring (lower bandwidth) | No |
-
-**Recommended approach**:
-- Use **WebSocket** for desktop applications requiring real-time bidirectional communication
-- Use **SSE** for read-only monitoring applications
-- Use **REST API** for infrequent status checks or simple control interfaces
-
-All interfaces include CORS support for cross-origin requests from desktop applications.
-
-For questions or issues, check the ESP32 serial console output (115200 baud) for diagnostic information.
+## Amplifier serial protocol
+
+RS-232, 9600 8N1, on UART2 (RX GPIO16, TX GPIO17).
+
+Frame: `| 0x55 | Address | Length | Data… | Checksum |` where `Length` counts
+every byte including the start byte and checksum, and
+`Checksum = 256 - (sum of preceding bytes & 0xFF)`. A correctly received frame
+sums to zero across all bytes.
+
+Messages handled:
+
+| Address | Direction | Meaning |
+|---|---|---|
+| 0x11 | from amp | PCB versions (carries serial number) |
+| 0x13 | from amp | Serial number |
+| 0x21 | from amp | Fault log, 10 × 16-bit codes |
+| 0x27 | from amp | Band and antenna |
+| 0x2F | from amp | Telemetry, 72 bytes |
+| 0x81 | to amp | Command (request, mode, clear faults, band) |
+| 0x86 | to amp | Acknowledge |
+| 0x91 / 0x92 | to amp | Disable / enable automatic telemetry |
+
+Polling: telemetry 5 Hz, fault log every 2 s, band info every 10 s.

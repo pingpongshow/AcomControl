@@ -6,618 +6,733 @@
 import Foundation
 import Combine
 import Network
+import SwiftUI
 
-enum ConnectionState {
+enum ConnectionState: Equatable {
     case disconnected
     case connecting
     case connected
+    /// Reconnection was abandoned after exhausting the retry budget.
+    case failed(String)
+
+    var isConnected: Bool { self == .connected }
+
+    var label: String {
+        switch self {
+        case .disconnected: return "Disconnected"
+        case .connecting:   return "Connecting…"
+        case .connected:    return "Connected"
+        case .failed:       return "Connection failed"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .disconnected: return .secondary
+        case .connecting:   return .orange
+        case .connected:    return .green
+        case .failed:       return .red
+        }
+    }
 }
 
-class AmplifierController: ObservableObject {
-    @Published var connectionState: ConnectionState = .disconnected
-    @Published var amplifierState = AmplifierState()
-    @Published var connectedIP = ""
-    @Published var debugLog: [String] = []
-    
-    private var webSocketTask: URLSessionWebSocketTask?
-    private var reconnectTimer: Timer?
-    private var pingTimer: Timer?
-    private var reconnectAttempts = 0
+struct LogEntry: Identifiable {
+    let id = UUID()
+    let date: Date
+    let message: String
+    let isError: Bool
+    let isSuccess: Bool
+}
+
+@MainActor
+final class AmplifierController: ObservableObject {
+
+    // MARK: Published state
+
+    @Published private(set) var connectionState: ConnectionState = .disconnected
+    @Published private(set) var amplifierState = AmplifierState()
+    @Published private(set) var connectedHost = ""
+    @Published private(set) var debugLog: [LogEntry] = []
+
+    /// Rolling telemetry for the sparklines and history window.
+    @Published private(set) var history: [TelemetrySample] = []
+    @Published private(set) var stats = SessionStats()
+
+    /// Peak-hold values, reset with the session.
+    @Published private(set) var peakForward: Double = 0
+    @Published private(set) var peakSWR: Double = 1.0
+    @Published private(set) var peakTemperature: Double = 0
+
+    @Published var lastCommandError: String?
+
+    /// Set when the controller answered 401. The UI prompts for credentials.
+    @Published var needsCredentials = false
+
+    /// Controller diagnostics, refreshed in the background while connected so
+    /// the UI can report things like "this controller has no password".
+    @Published private(set) var systemInfo: SystemInfo?
+
+    let devices = DeviceStore()
+
+    // MARK: Configuration
+
+    /// 10 Hz telemetry for ~30 minutes.
+    private let historyLimit = 18_000
+    /// Samples are trimmed in blocks rather than one at a time: removeFirst(1)
+    /// on a full 18,000-element array shifts the whole array on every frame,
+    /// which at 10 Hz is ~180,000 element moves a second. Trimming a block
+    /// amortises that to a copy every 200 seconds.
+    private let historyTrimBlock = 2_000
+    private let maxLogEntries = 300
     private let maxReconnectAttempts = 10
     private let reconnectDelay: TimeInterval = 2.0
+
+    // MARK: Private state
+
+    private var webSocketTask: URLSessionWebSocketTask?
     private var urlSession: URLSession?
-    
-    // Network monitor to check local network access
     private var pathMonitor: NWPathMonitor?
-    
+
+    private var reconnectTimer: Timer?
+    private var pingTimer: Timer?
+    private var systemInfoTimer: Timer?
+    private var connectionTimeoutWork: DispatchWorkItem?
+    private var reconnectAttempts = 0
+    private var connectionGeneration = 0
+
+    private var lastSampleAt = Date()
+    private var wasTransmitting = false
+
+    /// Receive logging is rate limited. The previous version logged two lines
+    /// per frame at 10 Hz, which filled a 50 entry buffer in 2.5 seconds and
+    /// pushed every real error out of view.
+    private var framesSinceLastLog = 0
+    private var lastFrameLogAt = Date.distantPast
+
+    private let notifications = NotificationManager()
+
+    // MARK: Lifecycle
+
     init() {
-        // Create a URLSession with custom configuration
         let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForRequest = 15
         configuration.timeoutIntervalForResource = 300
-        configuration.waitsForConnectivity = true
-        self.urlSession = URLSession(configuration: configuration)
-        
-        // Start network monitoring to trigger permission prompt
+        configuration.waitsForConnectivity = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        urlSession = URLSession(configuration: configuration)
+
         startNetworkMonitoring()
-        
-        // Try to load last connected IP (but don't auto-connect)
-        if let lastIP = UserDefaults.standard.string(forKey: "lastConnectedIP") {
-            connectedIP = lastIP
+        notifications.requestAuthorizationIfNeeded()
+        FaultCatalog.reload()
+
+        log("AcomControl ready")
+
+        // v1.0 loaded the last address and then deliberately never used it.
+        if let host = devices.autoConnectHost, !host.isEmpty {
+            log("Auto-connecting to \(host)")
+            connect(to: host)
         }
-        
-        log("AmplifierController initialized")
     }
-    
+
     deinit {
-        disconnect()
+        pingTimer?.invalidate()
+        systemInfoTimer?.invalidate()
+        reconnectTimer?.invalidate()
         pathMonitor?.cancel()
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
         urlSession?.invalidateAndCancel()
     }
-    
-    private func log(_ message: String) {
-        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        let logMessage = "[\(timestamp)] \(message)"
-        print(logMessage)
-        DispatchQueue.main.async {
-            self.debugLog.append(logMessage)
-            if self.debugLog.count > 50 {
-                self.debugLog.removeFirst()
-            }
-        }
-    }
-    
+
     private func startNetworkMonitoring() {
-        pathMonitor = NWPathMonitor()
-        pathMonitor?.pathUpdateHandler = { [weak self] path in
-            self?.log("Network status: \(path.status)")
-            if path.status == .satisfied {
-                self?.log("Network available on: \(path.availableInterfaces.map { $0.name }.joined(separator: ", "))")
+        // Touching NWPathMonitor is what prompts macOS for local network access.
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            Task { @MainActor in
+                guard let self else { return }
+                if path.status != .satisfied {
+                    self.log("Network unavailable", isError: true)
+                }
             }
         }
-        pathMonitor?.start(queue: DispatchQueue.global(qos: .background))
+        monitor.start(queue: DispatchQueue.global(qos: .utility))
+        pathMonitor = monitor
     }
-    
-    // MARK: - Connection Management
-    
-    func connect(to ipAddress: String) {
-        // Ensure we're on main thread for state changes
-        guard Thread.isMainThread else {
-            DispatchQueue.main.async { [weak self] in
-                self?.connect(to: ipAddress)
-            }
-            return
+
+    // MARK: Logging
+
+    private func log(_ message: String, isError: Bool = false, isSuccess: Bool = false) {
+        #if DEBUG
+        print("[AcomControl] \(message)")
+        #endif
+        debugLog.append(LogEntry(date: Date(), message: message,
+                                 isError: isError, isSuccess: isSuccess))
+        if debugLog.count > maxLogEntries {
+            debugLog.removeFirst(debugLog.count - maxLogEntries)
         }
-        
-        log("Attempting to connect to \(ipAddress)")
-        
-        // Clean up any existing connection WITHOUT changing state
+    }
+
+    func clearDebugLog() { debugLog.removeAll() }
+
+    var debugLogText: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return debugLog.map { "[\(formatter.string(from: $0.date))] \($0.message)" }
+            .joined(separator: "\n")
+    }
+
+    // MARK: Connection
+
+    func connect(to host: String) {
+        let target = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return }
+
         cleanupConnection()
-        
-        connectedIP = ipAddress
-        UserDefaults.standard.set(ipAddress, forKey: "lastConnectedIP")
-        
-        // Set connecting state SYNCHRONOUSLY before creating task
+        connectionGeneration += 1
+        let generation = connectionGeneration
+
+        connectedHost = target
+        devices.autoConnectHost = target
+        devices.remember(host: target)
         connectionState = .connecting
-        
-        guard let url = URL(string: "ws://\(ipAddress)/ws") else {
-            log("ERROR: Invalid WebSocket URL: ws://\(ipAddress)/ws")
-            connectionState = .disconnected
+        lastCommandError = nil
+
+        guard let url = URL(string: "ws://\(target)/ws"), let session = urlSession else {
+            log("Invalid controller address: \(target)", isError: true)
+            connectionState = .failed("“\(target)” is not a valid address")
             return
         }
-        
-        log("WebSocket URL: \(url.absoluteString)")
-        
-        guard let session = urlSession else {
-            log("ERROR: URLSession not initialized")
-            connectionState = .disconnected
-            return
+
+        log("Connecting to \(target)…")
+        // Firmware 7.0 can require a password on the WebSocket upgrade as well
+        // as the REST API, so the task is built from a request, not a bare URL.
+        var request = URLRequest(url: url)
+        if let header = CredentialStore.credentials(for: target)?.basicAuthHeader {
+            request.setValue(header, forHTTPHeaderField: "Authorization")
         }
-        
-        log("Creating WebSocket task...")
-        webSocketTask = session.webSocketTask(with: url)
-        
-        // Log the task state
-        if let task = webSocketTask {
-            log("WebSocket task created, state: \(task.state.rawValue)")
-        }
-        
-        log("Resuming WebSocket task...")
-        webSocketTask?.resume()
-        log("WebSocket task resumed")
-        
-        // Start receiving messages immediately
-        receiveMessage()
-        
-        // Start ping timer
+        let task = session.webSocketTask(with: request)
+        webSocketTask = task
+        task.resume()
+
+        receiveMessage(generation: generation)
         startPingTimer()
-        
-        // Set timeout for connection
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
-            guard let self = self else { return }
+
+        // Give the handshake a bounded amount of time.
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.connectionGeneration == generation else { return }
             if self.connectionState == .connecting {
-                self.log("ERROR: Connection timeout after 10 seconds")
-                self.handleDisconnection()
+                self.log("Connection timed out after 10 s", isError: true)
+                self.handleDisconnection(generation: generation, reason: "Timed out")
             }
         }
+        connectionTimeoutWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
     }
-    
+
+    /// Reconnect to the current host, resetting the retry budget.
+    func retry() {
+        guard !connectedHost.isEmpty else { return }
+        reconnectAttempts = 0
+        connect(to: connectedHost)
+    }
+
     func disconnect() {
-        // Ensure we're on main thread for state changes
-        guard Thread.isMainThread else {
-            DispatchQueue.main.async { [weak self] in
-                self?.disconnect()
-            }
-            return
-        }
-        
-        log("Disconnecting...")
+        log("Disconnecting")
+        connectionGeneration += 1
         cleanupConnection()
         reconnectAttempts = 0
-        
-        // Set state synchronously
-        if connectionState != .disconnected {
-            connectionState = .disconnected
-            log("Disconnected")
-        }
+        connectionState = .disconnected
+        devices.autoConnectHost = nil
     }
-    
+
     private func cleanupConnection() {
-        // Clean up without changing connection state
+        connectionTimeoutWork?.cancel()
+        connectionTimeoutWork = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
-        stopPingTimer()
-        stopReconnectTimer()
-    }
-    
-    private func receiveMessage() {
-        guard let task = webSocketTask else {
-            log("ERROR: Cannot receive - no WebSocket task")
-            return
-        }
-        
-        log("Starting to receive messages...")
-        
-        task.receive { [weak self] result in
-            guard let self = self else { return }
-            
-            switch result {
-            case .success(let message):
-                switch message {
-                case .string(let text):
-                    self.log("Received text message (\(text.count) bytes)")
-                    self.handleMessage(text)
-                case .data(let data):
-                    self.log("Received binary message (\(data.count) bytes)")
-                    if let text = String(data: data, encoding: .utf8) {
-                        self.handleMessage(text)
-                    }
-                @unknown default:
-                    break
-                }
-                
-                // Continue receiving messages
-                self.receiveMessage()
-                
-            case .failure(let error):
-                self.log("ERROR: WebSocket receive error: \(error.localizedDescription)")
-                if let urlError = error as? URLError {
-                    self.log("ERROR: URLError code: \(urlError.code.rawValue)")
-                    self.log("ERROR: URLError description: \(urlError.localizedDescription)")
-                }
-                self.handleDisconnection()
-            }
-        }
-    }
-    
-    private func handleMessage(_ text: String) {
-        guard let data = text.data(using: .utf8) else {
-            log("ERROR: Cannot convert message to data")
-            return
-        }
-        
-        do {
-            let decoder = JSONDecoder()
-            let state = try decoder.decode(AmplifierState.self, from: data)
-            
-            DispatchQueue.main.async {
-                self.amplifierState = state
-                
-                // Mark as connected on first message
-                if self.connectionState == .connecting {
-                    self.connectionState = .connected
-                    self.reconnectAttempts = 0
-                    self.log("✓ Connected successfully! Receiving telemetry.")
-                }
-            }
-        } catch {
-            log("ERROR: Failed to decode message: \(error.localizedDescription)")
-        }
-    }
-    
-    private func handleDisconnection() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            
-            guard self.connectionState != .disconnected else { 
-                self.log("Already disconnected, skipping reconnection logic")
-                return 
-            }
-            
-            self.log("Handling disconnection...")
-            self.connectionState = .disconnected
-            self.cleanupConnection()
-            
-            // Attempt reconnection only if we haven't exceeded max attempts
-            guard self.reconnectAttempts < self.maxReconnectAttempts,
-                  !self.connectedIP.isEmpty else {
-                if self.reconnectAttempts >= self.maxReconnectAttempts {
-                    self.log("Max reconnection attempts (\(self.maxReconnectAttempts)) reached")
-                }
-                return
-            }
-            
-            self.reconnectAttempts += 1
-            let delay = min(self.reconnectDelay * Double(self.reconnectAttempts), 30.0) // Cap at 30 seconds
-            self.log("Reconnecting in \(Int(delay))s... (attempt \(self.reconnectAttempts)/\(self.maxReconnectAttempts))")
-            
-            self.reconnectTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-                guard let self = self else { return }
-                self.connect(to: self.connectedIP)
-            }
-            RunLoop.main.add(self.reconnectTimer!, forMode: .common)
-        }
-    }
-    
-    private func startPingTimer() {
-        stopPingTimer()
-        log("Starting ping timer...")
-        
-        pingTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
-            self?.sendPing()
-        }
-        RunLoop.main.add(pingTimer!, forMode: .common)
-    }
-    
-    private func stopPingTimer() {
-        if pingTimer != nil {
-            log("Stopping ping timer")
-        }
         pingTimer?.invalidate()
         pingTimer = nil
-    }
-    
-    private func stopReconnectTimer() {
         reconnectTimer?.invalidate()
         reconnectTimer = nil
+        systemInfoTimer?.invalidate()
+        systemInfoTimer = nil
     }
-    
-    private func sendPing() {
-        guard webSocketTask != nil else { return }
-        
-        log("Sending ping...")
-        webSocketTask?.sendPing { [weak self] error in
-            if let error = error {
-                self?.log("Ping failed: \(error.localizedDescription)")
-                self?.handleDisconnection()
-            } else {
-                self?.log("Ping successful")
-            }
-        }
-    }
-    
-    // MARK: - Command Sending
-    
-    private func sendCommand(_ command: [String: Any]) {
-        guard connectionState == .connected else {
-            log("Cannot send command: not connected (state: \(connectionState))")
-            return
-        }
-        
-        guard let webSocketTask = webSocketTask else {
-            log("Cannot send command: WebSocket task is nil")
-            return
-        }
-        
-        do {
-            let data = try JSONSerialization.data(withJSONObject: command)
-            guard let jsonString = String(data: data, encoding: .utf8) else {
-                log("Failed to convert command to string")
-                return
-            }
-            let message = URLSessionWebSocketTask.Message.string(jsonString)
-            
-            webSocketTask.send(message) { [weak self] error in
-                if let error = error {
-                    self?.log("Failed to send command: \(error.localizedDescription)")
-                } else {
-                    if let cmdName = command["cmd"] as? String {
-                        self?.log("Command sent: \(cmdName) - \(jsonString)")
+
+    private func receiveMessage(generation: Int) {
+        guard let task = webSocketTask else { return }
+
+        task.receive { [weak self] result in
+            Task { @MainActor in
+                guard let self, self.connectionGeneration == generation else { return }
+
+                switch result {
+                case .success(let message):
+                    switch message {
+                    case .string(let text):
+                        self.handleMessage(text)
+                    case .data(let data):
+                        if let text = String(data: data, encoding: .utf8) {
+                            self.handleMessage(text)
+                        }
+                    @unknown default:
+                        break
                     }
+                    self.receiveMessage(generation: generation)
+
+                case .failure(let error):
+                    // A controller with a password set rejects the upgrade with
+                    // 401, which surfaces here as an opaque socket error. Say
+                    // what it actually is so the UI can ask for the password.
+                    if let http = task.response as? HTTPURLResponse, http.statusCode == 401 {
+                        self.needsCredentials = true
+                        self.log("The controller requires a password", isError: true)
+                        self.cleanupConnection()
+                        self.connectionState = .failed("This controller requires a password")
+                        return
+                    }
+                    self.log("Receive failed: \(error.localizedDescription)", isError: true)
+                    self.handleDisconnection(generation: generation,
+                                             reason: error.localizedDescription)
                 }
             }
-        } catch {
-            log("Failed to encode command: \(error.localizedDescription)")
         }
     }
-    
-    func setMode(_ mode: Int) {
-        sendCommand(["cmd": "setMode", "mode": mode])
+
+    private func handleMessage(_ text: String) {
+        guard let data = text.data(using: .utf8) else { return }
+
+        // The controller replies to a rejected command with an error envelope
+        // rather than a state frame.
+        if text.contains("\"success\"") ,
+           let envelope = try? JSONDecoder().decode(APIResponse<EmptyResponse>.self, from: data),
+           envelope.success == false {
+            let message = envelope.error ?? "Command rejected"
+            log("Controller rejected command: \(message)", isError: true)
+            lastCommandError = message
+            return
+        }
+
+        guard let state = try? JSONDecoder().decode(AmplifierState.self, from: data) else {
+            log("Could not decode telemetry frame", isError: true)
+            return
+        }
+
+        if connectionState != .connected {
+            connectionState = .connected
+            reconnectAttempts = 0
+            connectionTimeoutWork?.cancel()
+            log("Connected — receiving telemetry", isSuccess: true)
+            devices.remember(host: connectedHost, serialNumber: state.serialNumber)
+            startSystemInfoTimer()
+        }
+
+        // One summary line per 10 s instead of two lines per frame.
+        framesSinceLastLog += 1
+        if Date().timeIntervalSince(lastFrameLogAt) >= 10 {
+            log("Telemetry healthy (\(framesSinceLastLog) frames in the last 10 s)")
+            framesSinceLastLog = 0
+            lastFrameLogAt = Date()
+        }
+
+        ingest(state)
     }
-    
-    func setBand(_ band: Int) {
-        sendCommand(["cmd": "setBand", "band": band, "antenna": 1])
+
+    private func ingest(_ state: AmplifierState) {
+        let now = Date()
+        let interval = min(now.timeIntervalSince(lastSampleAt), 1.0)
+        lastSampleAt = now
+
+        let previous = amplifierState
+        amplifierState = state
+
+        stats.ingest(state, wasTx: wasTransmitting, interval: interval)
+        wasTransmitting = state.isTx
+
+        peakForward = max(peakForward, state.forwardPower)
+        peakTemperature = max(peakTemperature, state.temperature)
+        if state.isTx { peakSWR = max(peakSWR, state.swr) }
+
+        history.append(TelemetrySample(date: now, state: state))
+        if history.count > historyLimit + historyTrimBlock {
+            history.removeFirst(history.count - historyLimit)
+        }
+
+        notifications.evaluate(state: state, previous: previous)
     }
-    
+
+    /// Folds telemetry the controller recorded before this app connected into
+    /// the session history, keeping everything ordered by time.
+    ///
+    /// v2.0 fetched this and threw it away: `HistoryView` awaited the request,
+    /// reported how many samples came back, and then had nowhere to put them.
+    /// Returns the number of samples actually added.
+    @discardableResult
+    func mergeHistory(_ imported: [TelemetrySample]) -> Int {
+        guard !imported.isEmpty else { return 0 }
+
+        // Controller samples are anchored to its own uptime clock, so a second
+        // import of an overlapping window would duplicate points. Keep only
+        // samples older than everything we recorded ourselves.
+        let oldestLocal = history.first?.date ?? Date.distantFuture
+        let fresh = imported.filter { $0.date < oldestLocal }
+        guard !fresh.isEmpty else { return 0 }
+
+        history.insert(contentsOf: fresh.sorted { $0.date < $1.date }, at: 0)
+        if history.count > historyLimit + historyTrimBlock {
+            history.removeFirst(history.count - historyLimit)
+        }
+        log("Loaded \(fresh.count) samples recorded by the controller", isSuccess: true)
+        return fresh.count
+    }
+
+    private func handleDisconnection(generation: Int, reason: String) {
+        guard connectionGeneration == generation else { return }
+        guard connectionState != .disconnected else { return }
+
+        cleanupConnection()
+
+        guard reconnectAttempts < maxReconnectAttempts, !connectedHost.isEmpty else {
+            let message = "Gave up after \(maxReconnectAttempts) attempts. \(reason)"
+            log(message, isError: true)
+            connectionState = .failed(message)
+            notifications.notifyDisconnected(host: connectedHost)
+            return
+        }
+
+        connectionState = .connecting
+        reconnectAttempts += 1
+        let delay = min(reconnectDelay * Double(reconnectAttempts), 30.0)
+        log("Reconnecting in \(Int(delay)) s (attempt \(reconnectAttempts)/\(maxReconnectAttempts))")
+
+        let timer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.connectionGeneration == generation else { return }
+                self.connect(to: self.connectedHost)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        reconnectTimer = timer
+    }
+
+    private func startPingTimer() {
+        pingTimer?.invalidate()
+        // scheduledTimer already installs on the current run loop; adding it a
+        // second time (as v1.0 did) is redundant.
+        let timer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.sendPing() }
+        }
+        pingTimer = timer
+    }
+
+    /// Polls /api/system so the UI can show controller diagnostics and warn
+    /// when the controller is left unauthenticated.
+    private func startSystemInfoTimer() {
+        systemInfoTimer?.invalidate()
+        refreshSystemInfo()
+        let timer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshSystemInfo() }
+        }
+        systemInfoTimer = timer
+    }
+
+    private func refreshSystemInfo() {
+        Task { @MainActor in
+            systemInfo = try? await getSystemInfo()
+        }
+    }
+
+    private func sendPing() {
+        guard let task = webSocketTask else { return }
+        let generation = connectionGeneration
+        task.sendPing { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor in
+                self?.log("Ping failed: \(error.localizedDescription)", isError: true)
+                self?.handleDisconnection(generation: generation,
+                                          reason: error.localizedDescription)
+            }
+        }
+    }
+
+    // MARK: Session
+
+    func resetSession() {
+        history.removeAll()
+        stats.reset()
+        peakForward = 0
+        peakSWR = 1.0
+        peakTemperature = 0
+        log("Session statistics reset")
+    }
+
+    /// Telemetry from the last `window` seconds, for the sparklines.
+    ///
+    /// Binary search, not `firstIndex(where:)`. The samples are in time order
+    /// and the cutoff is near the END of the array, so a linear scan from the
+    /// front walked almost the whole history — on every SwiftUI body evaluation,
+    /// for three gauges, ten times a second.
+    func recentSamples(seconds window: TimeInterval) -> [TelemetrySample] {
+        let cutoff = Date().addingTimeInterval(-window)
+        var low = 0, high = history.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if history[mid].date < cutoff { low = mid + 1 } else { high = mid }
+        }
+        guard low < history.count else { return [] }
+        return Array(history[low...])
+    }
+
+    // MARK: Commands
+
+    private func send(_ command: [String: Any]) {
+        guard connectionState.isConnected, let task = webSocketTask else {
+            lastCommandError = "Not connected to a controller"
+            log("Command dropped — not connected", isError: true)
+            return
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: command),
+              let json = String(data: data, encoding: .utf8) else { return }
+
+        task.send(.string(json)) { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor in
+                self?.log("Send failed: \(error.localizedDescription)", isError: true)
+                self?.lastCommandError = error.localizedDescription
+            }
+        }
+    }
+
+    /// `force` carries the operator's confirmation to the controller, which
+    /// otherwise refuses to cut the supply mid-transmission.
+    func setMode(_ mode: AmplifierMode, force: Bool = false) {
+        log("Requesting mode \(mode.title)")
+        send(["cmd": "setMode", "mode": mode.rawValue, "force": force])
+    }
+
+    /// Band changes keep the currently selected antenna. v1.0 hardcoded
+    /// antenna 1 on every band button, silently overriding the operator.
+    ///
+    /// `force` is the operator's answer to the hot-switching confirmation: the
+    /// controller refuses band changes under RF without it.
+    func setBand(_ code: Int, antenna: Int? = nil, force: Bool = false) {
+        let ant = antenna ?? max(1, amplifierState.antenna)
+        log("Requesting band \(BandSelection.name(for: code)) on antenna \(ant)")
+        send(["cmd": "setBand", "band": code, "antenna": ant, "force": force])
+    }
+
+    func setAntenna(_ antenna: Int, force: Bool = false) {
+        guard amplifierState.bandCode > 0 else {
+            lastCommandError = "No band is selected yet"
+            return
+        }
+        log("Requesting antenna \(antenna)")
+        send(["cmd": "setAntenna", "antenna": antenna,
+              "band": amplifierState.bandCode, "force": force])
+    }
+
     func clearErrors() {
-        sendCommand(["cmd": "clearErrors"])
+        log("Clearing soft faults")
+        send(["cmd": "clearErrors"])
     }
-    
-    func clearDebugLog() {
-        DispatchQueue.main.async {
-            self.debugLog.removeAll()
-        }
+
+    func requestInfo() {
+        send(["cmd": "requestInfo"])
     }
-    
-    // MARK: - REST API Methods
-    
-    func fetchStatus() async throws -> AmplifierState {
-        guard !connectedIP.isEmpty else {
-            throw NetworkError.invalidIP
-        }
-        
-        guard let url = URL(string: "http://\(connectedIP)/api/status") else {
+
+    /// Feeds a transceiver frequency to the controller for automatic band following.
+    func reportFrequency(kHz: Int) {
+        send(["cmd": "setFrequency", "frequency": kHz])
+    }
+
+    // MARK: REST
+
+    private func url(_ path: String) throws -> URL {
+        guard !connectedHost.isEmpty else { throw NetworkError.notConnected }
+        guard let url = URL(string: "http://\(connectedHost)\(path)") else {
             throw NetworkError.invalidURL
         }
-        
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 5.0
-        
-        let (data, response) = try await URLSession.shared.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
+        return url
+    }
+
+    /// Builds a request against the connected controller, carrying credentials
+    /// when any are stored for it.
+    private func request(_ path: String, timeout: TimeInterval) throws -> URLRequest {
+        var request = URLRequest(url: try url(path))
+        request.timeoutInterval = timeout
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        if let header = CredentialStore.credentials(for: connectedHost)?.basicAuthHeader {
+            request.setValue(header, forHTTPHeaderField: "Authorization")
+        }
+        return request
+    }
+
+    /// Notes a 401 so the UI can ask for a password, and reports it as an error.
+    private func authFailure() -> NetworkError {
+        needsCredentials = true
+        return .apiError("The controller requires a password")
+    }
+
+    private func get<T: Decodable>(_ path: String, as type: T.Type,
+                                   timeout: TimeInterval = 5) async throws -> T {
+        // The session configured in init(), not URLSession.shared: that is where
+        // the cache policy and the timeouts for this app live.
+        guard let session = urlSession else { throw NetworkError.notConnected }
+        let (data, response) = try await session.data(for: try request(path, timeout: timeout))
+        guard let http = response as? HTTPURLResponse else {
             throw NetworkError.apiError("Invalid response")
         }
-        
-        guard httpResponse.statusCode == 200 else {
-            throw NetworkError.apiError("HTTP \(httpResponse.statusCode)")
+        if http.statusCode == 401 { throw authFailure() }
+        guard http.statusCode == 200 else {
+            throw NetworkError.apiError("HTTP \(http.statusCode)")
         }
-        
-        let apiResponse = try JSONDecoder().decode(APIResponse<AmplifierState>.self, from: data)
-        
-        if apiResponse.success, let state = apiResponse.data {
-            return state
-        } else {
-            throw NetworkError.apiError(apiResponse.error ?? "Unknown error")
-        }
+        needsCredentials = false
+        return try APIDecoder.payload(type, from: data)
     }
-    
-    func getSystemInfo() async throws -> SystemInfo {
-        guard !connectedIP.isEmpty else {
-            throw NetworkError.invalidIP
-        }
-        
-        guard let url = URL(string: "http://\(connectedIP)/api/system") else {
-            throw NetworkError.invalidURL
-        }
-        
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 5.0
-        
-        let (data, response) = try await URLSession.shared.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw NetworkError.apiError("Invalid response")
-        }
-        
-        guard httpResponse.statusCode == 200 else {
-            throw NetworkError.apiError("HTTP \(httpResponse.statusCode)")
-        }
-        
-        let apiResponse = try JSONDecoder().decode(APIResponse<SystemInfo>.self, from: data)
-        
-        if apiResponse.success, let info = apiResponse.data {
-            return info
-        } else {
-            throw NetworkError.apiError(apiResponse.error ?? "Unknown error")
-        }
-    }
-    
-    func configureWiFi(ssid: String, password: String) async throws {
-        guard !connectedIP.isEmpty else {
-            throw NetworkError.invalidIP
-        }
-        
-        guard let url = URL(string: "http://\(connectedIP)/api/wifi") else {
-            throw NetworkError.invalidURL
-        }
-        
-        var request = URLRequest(url: url)
+
+    @discardableResult
+    private func post(_ path: String, body: [String: Any],
+                      timeout: TimeInterval = 10) async throws -> Data {
+        guard let session = urlSession else { throw NetworkError.notConnected }
+        var request = try request(path, timeout: timeout)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 10.0
-        
-        let body = ["ssid": ssid, "password": password]
-        request.httpBody = try JSONEncoder().encode(body)
-        
-        let (data, response) = try await URLSession.shared.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
             throw NetworkError.apiError("Invalid response")
         }
-        
-        guard httpResponse.statusCode == 200 else {
-            throw NetworkError.apiError("HTTP \(httpResponse.statusCode)")
+        if http.statusCode == 401 { throw authFailure() }
+        if let envelope = try? JSONDecoder().decode(APIResponse<EmptyResponse>.self, from: data),
+           !envelope.success {
+            throw NetworkError.apiError(envelope.error ?? "Request failed")
         }
-        
-        let apiResponse = try JSONDecoder().decode(APIResponse<EmptyResponse>.self, from: data)
-        
-        if !apiResponse.success {
-            throw NetworkError.apiError(apiResponse.error ?? "WiFi configuration failed")
+        guard (200...299).contains(http.statusCode) else {
+            throw NetworkError.apiError("HTTP \(http.statusCode)")
         }
+        needsCredentials = false
+        return data
     }
-}
 
-// MARK: - Data Models
+    // MARK: Credentials
 
-struct AmplifierState: Codable {
-    var connected: Bool = false
-    var mode: String = "N/A"
-    var modeCode: Int = 0
-    var band: String = "N/A"
-    var bandCode: Int = 0
-    var antenna: Int = 1
-    var isTx: Bool = false
-    var forwardPower: Double = 0.0
-    var reflectedPower: Double = 0.0
-    var swr: Double = 1.0
-    var temperature: Double = 0.0
-    var inputPower: Double = 0.0
-    var current: Double = 0.0
-    var frequency: Int = 0
-    var fanSpeed: Int = 0
-    var hvVoltage: Int = 0
-    var vcc5: Int = 0
-    var vcc26: Int = 0
-    var pdcPower: Double = 0.0
-    var disPower: Double = 0.0
-    var lpfChannel: Int = 0
-    var errorCode: Int = 0
-    var errorParam: Int = 0
-    var errors: [Int] = []  // Changed to [Int] to match ESP32 output
-    var serialNumber: String = "Unknown"
-    var lastUpdate: Int = 0
-    var msgCount: Int = 0
-    
-    // Custom decoding to handle missing fields gracefully and apply scaling
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        
-        connected = (try? container.decode(Bool.self, forKey: .connected)) ?? false
-        mode = (try? container.decode(String.self, forKey: .mode)) ?? "N/A"
-        modeCode = (try? container.decode(Int.self, forKey: .modeCode)) ?? 0
-        band = (try? container.decode(String.self, forKey: .band)) ?? "N/A"
-        bandCode = (try? container.decode(Int.self, forKey: .bandCode)) ?? 0
-        antenna = (try? container.decode(Int.self, forKey: .antenna)) ?? 1
-        isTx = (try? container.decode(Bool.self, forKey: .isTx)) ?? false
-        forwardPower = (try? container.decode(Double.self, forKey: .forwardPower)) ?? 0.0
-        reflectedPower = (try? container.decode(Double.self, forKey: .reflectedPower)) ?? 0.0
-        
-        // SWR comes as 100x (e.g., 130 = 1.30:1), so divide by 100
-        let rawSwr = (try? container.decode(Double.self, forKey: .swr)) ?? 100.0
-        swr = rawSwr / 100.0
-        
-        // Temperature comes in Kelvin, convert to Celsius
-        let rawTemp = (try? container.decode(Double.self, forKey: .temperature)) ?? 273.0
-        temperature = rawTemp - 273.0
-        
-        // Input power comes as 10x W (e.g., 253 = 25.3W), so divide by 10
-        let rawInputPower = (try? container.decode(Double.self, forKey: .inputPower)) ?? 0.0
-        inputPower = rawInputPower / 10.0
-        
-        // Current comes in mA, convert to A
-        let rawCurrent = (try? container.decode(Double.self, forKey: .current)) ?? 0.0
-        current = rawCurrent / 1000.0
-        
-        frequency = (try? container.decode(Int.self, forKey: .frequency)) ?? 0
-        fanSpeed = (try? container.decode(Int.self, forKey: .fanSpeed)) ?? 0
-        
-        // HV voltage comes as 10x V, so divide by 10
-        let rawHV = (try? container.decode(Int.self, forKey: .hvVoltage)) ?? 0
-        hvVoltage = rawHV / 10
-        
-        vcc5 = (try? container.decode(Int.self, forKey: .vcc5)) ?? 0
-        vcc26 = (try? container.decode(Int.self, forKey: .vcc26)) ?? 0
-        pdcPower = (try? container.decode(Double.self, forKey: .pdcPower)) ?? 0.0
-        disPower = (try? container.decode(Double.self, forKey: .disPower)) ?? 0.0
-        lpfChannel = (try? container.decode(Int.self, forKey: .lpfChannel)) ?? 0
-        errorCode = (try? container.decode(Int.self, forKey: .errorCode)) ?? 0
-        errorParam = (try? container.decode(Int.self, forKey: .errorParam)) ?? 0
-        errors = (try? container.decode([Int].self, forKey: .errors)) ?? []
-        serialNumber = (try? container.decode(String.self, forKey: .serialNumber)) ?? "Unknown"
-        lastUpdate = (try? container.decode(Int.self, forKey: .lastUpdate)) ?? 0
-        msgCount = (try? container.decode(Int.self, forKey: .msgCount)) ?? 0
+    var storedCredentials: ControllerCredentials? {
+        CredentialStore.credentials(for: connectedHost)
     }
-    
-    init() {
-        // Default initializer
+
+    /// Saves credentials for the connected controller and reconnects with them.
+    func setCredentials(user: String, password: String) {
+        guard !connectedHost.isEmpty else { return }
+        if password.isEmpty {
+            CredentialStore.remove(for: connectedHost)
+            log("Cleared the saved password for \(connectedHost)")
+        } else {
+            CredentialStore.save(ControllerCredentials(user: user, password: password),
+                                 for: connectedHost)
+            log("Saved a password for \(connectedHost)")
+        }
+        needsCredentials = false
+        retry()
     }
-    
-    private enum CodingKeys: String, CodingKey {
-        case connected, mode, modeCode, band, bandCode, antenna, isTx
-        case forwardPower, reflectedPower, swr, temperature, inputPower, current
-        case frequency, fanSpeed, hvVoltage, vcc5, vcc26, pdcPower, disPower
-        case lpfChannel, errorCode, errorParam, errors, serialNumber, lastUpdate, msgCount
+
+    func fetchStatus() async throws -> AmplifierState {
+        try await get("/api/status", as: AmplifierState.self)
     }
-}
 
-struct SystemInfo: Codable {
-    let chipModel: String
-    let chipRevision: Int
-    let cpuFreqMHz: Int
-    let flashSize: Int
-    let freeHeap: Int
-    let psramSize: Int
-    let psramFree: Int
-    let uptime: Int
-    let wifiMode: String
-    let wifiSSID: String
-    let ipAddress: String
-    let rssi: Int
-    let performance: PerformanceInfo
-}
+    func getSystemInfo() async throws -> SystemInfo {
+        try await get("/api/system", as: SystemInfo.self)
+    }
 
-struct PerformanceInfo: Codable {
-    let wsUpdateCount: Int
-    let sseUpdateCount: Int
-    let serialRxCount: Int
-    let wsClients: Int
-    let sseClients: Int
-}
+    func getConfig() async throws -> ControllerConfig {
+        try await get("/api/config", as: ControllerConfig.self)
+    }
 
-struct APIResponse<T: Codable>: Codable {
-    let success: Bool
-    let timestamp: Int?
-    let data: T?
-    let error: String?
-}
+    func setConfig(autoBandFollow: Bool? = nil,
+                   logging: Bool? = nil,
+                   hostname: String? = nil,
+                   apiUser: String? = nil,
+                   apiPassword: String? = nil,
+                   apPassword: String? = nil) async throws {
+        var body: [String: Any] = [:]
+        if let autoBandFollow { body["autoBandFollow"] = autoBandFollow }
+        if let logging { body["logging"] = logging }
+        if let hostname { body["hostname"] = hostname }
+        if let apiUser { body["apiUser"] = apiUser }
+        if let apiPassword { body["apiPassword"] = apiPassword }
+        if let apPassword { body["apPassword"] = apPassword }
+        guard !body.isEmpty else { return }
+        try await post("/api/config", body: body)
 
-struct EmptyResponse: Codable {}
-
-enum NetworkError: Error, LocalizedError {
-    case invalidIP
-    case invalidURL
-    case apiError(String)
-    
-    var errorDescription: String? {
-        switch self {
-        case .invalidIP:
-            return "Invalid IP address"
-        case .invalidURL:
-            return "Invalid URL"
-        case .apiError(let message):
-            return message
+        // Keep the keychain in step: changing the controller's password without
+        // updating ours would lock the app out at the next reconnect.
+        if let apiPassword {
+            setCredentials(user: apiUser ?? storedCredentials?.user ?? "acom",
+                           password: apiPassword)
         }
     }
-}
 
-// MARK: - Band Selection Helper
+    func configureWiFi(ssid: String, password: String) async throws {
+        try await post("/api/wifi", body: ["ssid": ssid, "password": password])
+    }
 
-struct BandSelection {
-    let code: Int
-    let name: String
-    
-    // Band codes match ESP32: 1=160m, 2=80/60m, 3=40m, 4=30m, 5=20m, 6=17m, 7=15m, 8=12m, 9=10m, 10=6m
-    static let allBands = [
-        BandSelection(code: 1, name: "160m"),
-        BandSelection(code: 2, name: "80/60m"),
-        BandSelection(code: 3, name: "40m"),
-        BandSelection(code: 4, name: "30m"),
-        BandSelection(code: 5, name: "20m"),
-        BandSelection(code: 6, name: "17m"),
-        BandSelection(code: 7, name: "15m"),
-        BandSelection(code: 8, name: "12m"),
-        BandSelection(code: 9, name: "10m"),
-        BandSelection(code: 10, name: "6m")
-    ]
+    /// Fetches the telemetry the controller recorded before the app connected
+    /// and folds it into the session history. Returns the number added.
+    @discardableResult
+    func importDeviceHistory(points: Int = 600) async throws -> Int {
+        mergeHistory(try await fetchDeviceHistory(points: points))
+    }
+
+    /// Telemetry recorded by the controller itself, covering time before the
+    /// app connected.
+    func fetchDeviceHistory(points: Int = 600) async throws -> [TelemetrySample] {
+        struct HistoryPayload: Decodable {
+            let samples: [[Double]]
+        }
+        let payload = try await get("/api/history?points=\(points)",
+                                    as: HistoryPayload.self, timeout: 15)
+
+        // fields: [t, forwardPower, reflectedPower, swr, temperature, current, frequency, band, tx]
+        let now = Date()
+        guard let newest = payload.samples.last?.first else { return [] }
+
+        return payload.samples.compactMap { row in
+            guard row.count >= 9 else { return nil }
+            var state = AmplifierState()
+            state.forwardPower = row[1]
+            state.reflectedPower = row[2]
+            state.swr = row[3] / 100.0
+            state.temperature = row[4] - 273.0
+            state.current = row[5] / 1000.0
+            state.frequency = Int(row[6])
+            state.bandCode = Int(row[7])
+            state.isTx = row[8] != 0
+            // Controller timestamps are uptime milliseconds; anchor the newest
+            // sample to now and work backwards.
+            let age = (newest - row[0]) / 1000.0
+            return TelemetrySample(date: now.addingTimeInterval(-age), state: state)
+        }
+    }
+
+    /// Downloads the controller's CSV session log through the authenticated
+    /// session. Handing the URL to a browser instead would make the operator
+    /// re-enter the controller's password there once one is set.
+    func downloadDeviceLog() async throws -> Data {
+        guard let session = urlSession else { throw NetworkError.notConnected }
+        let (data, response) = try await session.data(
+            for: try request("/api/history/download", timeout: 30))
+        guard let http = response as? HTTPURLResponse else {
+            throw NetworkError.apiError("Invalid response")
+        }
+        if http.statusCode == 401 { throw authFailure() }
+        if http.statusCode == 404 {
+            throw NetworkError.apiError("The controller has no session log yet")
+        }
+        guard http.statusCode == 200 else {
+            throw NetworkError.apiError("HTTP \(http.statusCode)")
+        }
+        return data
+    }
+
+    func clearDeviceHistory() async throws {
+        try await post("/api/history/clear", body: [:])
+    }
 }

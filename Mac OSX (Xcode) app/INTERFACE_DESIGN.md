@@ -1,5 +1,11 @@
 # AcomControl - Interface Design
 
+> **Note — partially superseded.** This document describes the pre-6.0 firmware /
+> pre-2.0 app. Hardware, wiring and protocol sections remain accurate; the UI,
+> feature lists and API examples do not. See [CHANGELOG.md](../CHANGELOG.md) and
+> the rewritten [API_DOCUMENTATION.md](../Arduino%20(ESP32)%20code/API_DOCUMENTATION.md).
+
+
 ## Visual Layout Description
 
 Since this is a text-based delivery, here's a detailed description of what the interface looks like when running:
@@ -86,12 +92,16 @@ Mode Control
 ### Band Selection
 ```
 Band Selection
-┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
-│160m│80m │60m │40m │30m │20m │17m │15m │12m │10m │
-└────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+┌────┬────┬──────┬────┬────┬────┬────┬────┬────┬────┐
+│160m│80m │40/60m│30m │20m │17m │15m │12m │10m │6m  │
+└────┴────┴──────┴────┴────┴────┴────┴────┴────┴────┘
 ```
 - Purple background for active band
 - Gray background for inactive bands
+- Ten buttons, codes 1–10. 60m has no band code of its own: it shares the 40m
+  low-pass filter, so it rides on code 3. The grid wraps to the window width.
+- Changing band while transmitting asks for confirmation first, and the
+  confirmation is what lets the controller act — it refuses otherwise.
 
 ### Antenna Selection
 ```

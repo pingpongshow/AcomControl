@@ -1,14 +1,25 @@
 # AcomControl ESP32-S3 Quick Reference
 
+> **Note — partially superseded.** This document describes the pre-6.0 firmware /
+> pre-2.0 app. Hardware, wiring and protocol sections remain accurate; the UI,
+> feature lists and API examples do not. See [CHANGELOG.md](../CHANGELOG.md) and
+> the rewritten [API_DOCUMENTATION.md](../Arduino%20(ESP32)%20code/API_DOCUMENTATION.md).
+
+
 ## Network Access
 
 ### Default AP Mode
 ```
-SSID: AcomControl
-Password: acom1234
-IP: 192.168.4.1
-Web: http://192.168.4.1
+SSID:       AcomControl
+Passphrase: generated on first boot - printed on the serial console at
+            115200 baud, and readable later at GET /api/config
+IP:         192.168.4.1
+Web:        http://192.168.4.1
 ```
+
+Firmware 7.0 generates a random WPA2 passphrase on first boot and keeps it in
+NVS. v6.0 and earlier ran the access point wide open; this document previously
+claimed a passphrase of `acom1234`, which no firmware has ever used.
 
 ### Station Mode
 ```
@@ -24,6 +35,26 @@ Web: http://[IP_ADDRESS]
 ```
 http://[ESP32_IP]/api
 ```
+
+### Authentication
+
+Once an API password is set, every request needs HTTP Basic credentials:
+
+```bash
+curl -u acom:secret http://192.168.4.1/api/status
+```
+
+Set one with:
+
+```bash
+curl -X POST http://192.168.4.1/api/config \
+  -H "Content-Type: application/json" \
+  -d '{"apiPassword": "secret"}'
+```
+
+With no password set the API is open, and `GET /api/system` reports
+`"authEnabled": false`. Add `-u user:pass` to every example below if you have
+set one.
 
 ### Get Current Status
 ```bash
@@ -60,16 +91,25 @@ curl -X POST http://192.168.4.1/api/mode \
 ```
 
 ### Set Band
+
+Band codes are 1-10 (see [Band Codes](#band-codes)). Firmware 7.0 refuses a band
+change while the amplifier is transmitting unless you pass `"force": true`.
+
 ```bash
 # 20m with Antenna 2
 curl -X POST http://192.168.4.1/api/band \
   -H "Content-Type: application/json" \
-  -d '{"band": 6, "antenna": 2}'
+  -d '{"band": 5, "antenna": 2}'
 
 # 40m with Antenna 1
 curl -X POST http://192.168.4.1/api/band \
   -H "Content-Type: application/json" \
-  -d '{"band": 4, "antenna": 1}'
+  -d '{"band": 3, "antenna": 1}'
+
+# 6m, accepting the hot-switching risk while transmitting
+curl -X POST http://192.168.4.1/api/band \
+  -H "Content-Type: application/json" \
+  -d '{"band": 10, "antenna": 1, "force": true}'
 ```
 
 ### System Information
@@ -77,12 +117,25 @@ curl -X POST http://192.168.4.1/api/band \
 curl http://192.168.4.1/api/system
 ```
 
-### Clear Errors
+### Clear Soft Faults
 ```bash
 curl -X POST http://192.168.4.1/api/command \
   -H "Content-Type: application/json" \
-  -d '{"type": "clear_errors"}'
+  -d '{"cmd": "clearErrors"}'
 ```
+
+The key is `cmd`, and the value is `clearErrors`. This document previously showed
+`{"type": "clear_errors"}`, which no firmware has ever accepted - the controller
+answers `400 Missing cmd`.
+
+### Fault Code Names
+```bash
+curl http://192.168.4.1/api/faults
+```
+
+Returns the 126 named codes from section 3.4.1 of the ACOM RS-232 specification,
+each with its severity (`warning`, `soft` or `hard`). Static per firmware build,
+so fetch it once and cache it.
 
 ---
 
@@ -105,18 +158,21 @@ curl -X POST http://192.168.4.1/api/command \
 
 ## Band Codes
 
-| Code | Band | Frequency Range |
+| Code | Band | Frequency range |
 |------|------|-----------------|
-| 1 | 160m | 1.8-2.0 MHz |
-| 2 | 80m | 3.5-4.0 MHz |
-| 3 | 60m | 5.3-5.4 MHz |
-| 4 | 40m | 7.0-7.3 MHz |
-| 5 | 30m | 10.1-10.15 MHz |
-| 6 | 20m | 14.0-14.35 MHz |
-| 7 | 17m | 18.068-18.168 MHz |
-| 8 | 15m | 21.0-21.45 MHz |
-| 9 | 12m | 24.89-24.99 MHz |
-| 10 | 10m | 28.0-29.7 MHz |
+| 1 | 160m | 1.8–2.0 MHz |
+| 2 | 80m | 3.5–4.0 MHz |
+| 3 | 40m / 60m | 7.0–7.3 MHz, 5.25–5.45 MHz |
+| 4 | 30m | 10.1–10.15 MHz |
+| 5 | 20m | 14.0–14.35 MHz |
+| 6 | 17m | 18.068–18.168 MHz |
+| 7 | 15m | 21.0–21.45 MHz |
+| 8 | 12m | 24.89–24.99 MHz |
+| 9 | 10m | 28.0–29.7 MHz |
+| 10 | 6m | 50.0–54.0 MHz |
+
+One numbering throughout: the amplifier, the LPF channel in telemetry, the API
+and both UIs all use these codes. 60m shares the 40m filter and code 3.
 
 ---
 
@@ -138,10 +194,13 @@ ws.onmessage = (e) => {
 // Set mode to Operate
 ws.send(JSON.stringify({cmd: 'setMode', mode: 6}));
 
-// Set band to 20m
-ws.send(JSON.stringify({cmd: 'setBand', band: 6, antenna: 2}));
+// Set band to 20m (code 5)
+ws.send(JSON.stringify({cmd: 'setBand', band: 5, antenna: 2}));
 
-// Clear errors
+// Change band while transmitting, accepting the hot-switching risk
+ws.send(JSON.stringify({cmd: 'setBand', band: 5, antenna: 2, force: true}));
+
+// Clear soft faults
 ws.send(JSON.stringify({cmd: 'clearErrors'}));
 
 // Save WiFi config
@@ -197,18 +256,34 @@ for event in client.events():
 
 ### From Raw Values
 ```javascript
-// SWR (raw value is * 100)
-const swr = data.swr / 100;  // e.g., 105 → 1.05
+// SWR (x100)
+const swr = data.swr / 100;            // 212  -> 2.12
 
-// Temperature (Kelvin * 10)
-const tempC = (data.temperature - 273) / 10;  // e.g., 298 → 25°C
+// Temperature (degrees Kelvin - NOT Kelvin x10)
+const tempC = data.temperature - 273;  // 338  -> 65 C
 
-// Input Power (Watts * 10)
-const inputW = data.inputPower / 10;  // e.g., 150 → 15.0W
+// Drive power (x10 W)
+const inputW = data.inputPower / 10;   // 382  -> 38.2 W
 
-// Current (Milliamps)
-const currentA = data.current / 1000;  // e.g., 5500 → 5.5A
+// Drain current (mA)
+const currentA = data.current / 1000;  // 21400 -> 21.4 A
+
+// HV supply (x10 V) and VCC26 (x10 V)
+const hvV = data.hvVoltage / 10;       // 3180 -> 318.0 V
+
+// VCC5 (mV)
+const vcc5V = data.vcc5 / 1000;        // 5020 -> 5.02 V
+
+// Dissipation and DC input (x10 W)
+const disW = data.disPower / 10;       // 1640 -> 164.0 W
+
+// Fan: scale by the reported maximum, which is 4 - not 15, and not 100
+const fanPct = data.fanLevel * 100 / data.fanLevelMax;   // 4/4 -> 100%
 ```
+
+> Telemetry byte 16 is documented in section 3.4.8 as `temp1 [deg K]`, a plain
+> Kelvin value. This document previously divided by a further 10, and its own
+> worked example contradicted its own formula.
 
 ---
 

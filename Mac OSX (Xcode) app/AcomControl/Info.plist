@@ -14,24 +14,40 @@
 	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<!-- Driven by MARKETING_VERSION / CURRENT_PROJECT_VERSION in the project so
+	     the two cannot drift. v2.0 hardcoded 2.0/2 here while the project said
+	     1.0/1, and with GENERATE_INFOPLIST_FILE=NO this file won. -->
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSHumanReadableCopyright</key>
 	<string></string>
+	<!-- INFOPLIST_KEY_* build settings are ignored when GENERATE_INFOPLIST_FILE
+	     is NO, so the keys they were meant to provide live here. -->
+	<key>CFBundleDisplayName</key>
+	<string>AcomControl</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
 	
 	<!-- Local Network Usage Description -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>AcomControl needs access to your local network to discover and communicate with your ACOM 600S amplifier controller (ESP32-S3) over WiFi.</string>
 	
-	<!-- Bonjour Services (optional, for better local network support) -->
+	<!-- Bonjour service types the app is allowed to browse. A sandboxed app can
+	     only see service types listed here, so _acom._tcp (advertised by
+	     controller firmware 6.0 and later) must be declared for discovery. -->
 	<key>NSBonjourServices</key>
 	<array>
+		<string>_acom._tcp</string>
 		<string>_http._tcp</string>
 		<string>_ws._tcp</string>
 	</array>
+
+	<!-- The menu bar extra is the point of the app when the window is closed. -->
+	<key>LSUIElement</key>
+	<false/>
 </dict>
 </plist>
